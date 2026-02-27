@@ -1,4 +1,4 @@
-//! tunnel-mgr: A TUI for managing SSH tunnel connections.
+//! STunT: A TUI for managing SSH tunnel connections.
 
 mod app;
 mod config;

@@ -4,11 +4,11 @@
 //! multi-line entry rows with color-coded state, variable-height scrolling,
 //! and modal input forms for creating/editing SSH and K8s tunnel entries.
 
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::Frame;
 
 use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
 use crate::config::TunnelEntry;
@@ -77,7 +77,7 @@ fn render_title_bar(frame: &mut Frame, area: Rect) {
         .bg(COLOR_TITLE_BG)
         .add_modifier(Modifier::BOLD);
 
-    let title = "tunnel-mgr";
+    let title = "STunT";
     let hints = "[n]ew  [e]dit  [d]elete  [Enter] connect  [q]uit";
 
     let available = area.width as usize;

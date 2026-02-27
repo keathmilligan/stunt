@@ -1,8 +1,8 @@
 [package]
-name = "tunnel-mgr"
+name = "stunt"
 version = "0.1.0"
 edition = "2024"
-description = "A TUI for managing SSH tunnel connections"
+description = "STunT — Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections"
 
 [dependencies]
 anyhow = "1"

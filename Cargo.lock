@@ -751,6 +751,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "stunt"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "dirs",
+ "futures",
+ "libc",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.116"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -862,25 +881,6 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
-
-[[package]]
-name = "tunnel-mgr"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "dirs",
- "futures",
- "libc",
- "ratatui",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "uuid",
-]
 
 [[package]]
 name = "unicode-ident"

@@ -1,6 +1,15 @@
-# tunnel-mgr
+```
+  ____  _____            _____
+ / ___||_   _|_   _ _ __|_   _|
+ \___ \  | | | | | | '_ \| |
+  ___) | | | | |_| | | | | |
+ |____/  |_|  \__,_|_| |_|_|
+  Stupid Tunnel Tricks
+```
 
-A terminal user interface for defining, configuring, and managing SSH tunnel connections.
+# STunT
+
+**S**tupid **Tun**nel **T**ricks — a terminal user interface for defining, configuring, and managing SSH tunnel connections.
 
 ## Features
 
@@ -19,7 +28,7 @@ A terminal user interface for defining, configuring, and managing SSH tunnel con
 
 ```sh
 # Clone the repository
-git clone <repo-url> && cd tunnel-mgr
+git clone <repo-url> && cd stunt
 
 # Build
 cargo build --release
@@ -28,14 +37,14 @@ cargo build --release
 cargo run
 ```
 
-Configuration files are stored in `~/.config/tunnel-mgr/` by default.
+Configuration files are stored in `~/.config/stunt/` by default.
 
 ## Usage
 
 Launch the TUI:
 
 ```sh
-tunnel-mgr
+stunt
 ```
 
 ### Key Bindings

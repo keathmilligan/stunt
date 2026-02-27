@@ -1,10 +1,10 @@
-//! SSH command construction and detached process spawning.
+//! Tunnel command construction and detached process spawning.
 
 use std::process::Stdio;
 
 use tokio::process::Command;
 
-use crate::config::ServerEntry;
+use crate::config::{K8sEntry, K8sPortForward, ServerEntry};
 
 /// Build a `tokio::process::Command` from a `ServerEntry`.
 ///
@@ -52,15 +52,43 @@ pub fn build_ssh_command(entry: &ServerEntry) -> Command {
     cmd
 }
 
-/// Spawn the SSH command detached in a new session.
+/// Build a `tokio::process::Command` for a single `kubectl port-forward` binding.
 ///
-/// Calls `setsid()` via `pre_exec` so the SSH process survives the TUI
+/// The command form is:
+/// ```text
+/// kubectl port-forward [--context <ctx>] [-n <namespace>] <type>/<name> <bind>:<local>:<remote>
+/// ```
+pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Command {
+    let mut cmd = Command::new("kubectl");
+
+    cmd.arg("port-forward");
+
+    if let Some(ref ctx) = entry.context {
+        cmd.arg("--context").arg(ctx);
+    }
+
+    if let Some(ref ns) = entry.namespace {
+        cmd.arg("-n").arg(ns);
+    }
+
+    cmd.arg(entry.resource_identifier());
+    cmd.arg(forward.kubectl_arg());
+
+    // Capture all stdio so kubectl doesn't interfere with the TUI
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    cmd
+}
+
+/// Spawn the given command detached in a new session.
+///
+/// Calls `setsid()` via `pre_exec` so the process survives the TUI
 /// exiting. Returns the PID of the spawned process. The child handle is
 /// intentionally dropped — we monitor via PID polling, not `child.wait()`.
 #[cfg(unix)]
-pub fn spawn_detached(entry: &ServerEntry) -> anyhow::Result<u32> {
-    let mut cmd = build_ssh_command(entry);
-
+pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<u32> {
     // Safety: setsid() is async-signal-safe and has no preconditions beyond
     // the child not already being a session leader (which a freshly forked
     // child never is).
@@ -75,7 +103,7 @@ pub fn spawn_detached(entry: &ServerEntry) -> anyhow::Result<u32> {
 
     let child = cmd
         .spawn()
-        .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
 
     let pid = child
         .id()
@@ -88,14 +116,23 @@ pub fn spawn_detached(entry: &ServerEntry) -> anyhow::Result<u32> {
     Ok(pid)
 }
 
+/// Spawn the SSH command for the given `ServerEntry` as a detached process.
+///
+/// Delegates to `spawn_detached_cmd(build_ssh_command(entry))`.
+#[cfg(unix)]
+pub fn spawn_detached(entry: &ServerEntry) -> anyhow::Result<u32> {
+    spawn_detached_cmd(build_ssh_command(entry))
+        .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ServerEntry, TunnelForward};
+    use crate::config::{K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, TunnelForward};
     use uuid::Uuid;
 
     #[test]
-    fn test_build_command_basic() {
+    fn test_build_ssh_command_basic() {
         let entry = ServerEntry {
             id: Uuid::new_v4(),
             name: "test".to_string(),
@@ -123,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_command_with_all_options() {
+    fn test_build_ssh_command_with_all_options() {
         let entry = ServerEntry {
             id: Uuid::new_v4(),
             name: "full".to_string(),
@@ -169,6 +206,100 @@ mod tests {
         assert!(args.contains(&"-D".to_string()));
     }
 
+    fn make_k8s_entry(
+        context: Option<&str>,
+        namespace: Option<&str>,
+        resource_type: K8sResourceType,
+        resource_name: &str,
+    ) -> K8sEntry {
+        K8sEntry {
+            id: Uuid::new_v4(),
+            name: "test".to_string(),
+            context: context.map(|s| s.to_string()),
+            namespace: namespace.map(|s| s.to_string()),
+            resource_type,
+            resource_name: resource_name.to_string(),
+            forwards: vec![],
+            auto_restart: false,
+        }
+    }
+
+    fn make_k8s_fwd(local_port: u16, remote_port: u16) -> K8sPortForward {
+        K8sPortForward {
+            local_bind_address: "127.0.0.1".to_string(),
+            local_port,
+            remote_port,
+        }
+    }
+
+    #[test]
+    fn test_build_kubectl_command_all_options() {
+        let entry = make_k8s_entry(
+            Some("prod"),
+            Some("default"),
+            K8sResourceType::Deployment,
+            "api",
+        );
+        let fwd = make_k8s_fwd(8080, 80);
+        let cmd = build_kubectl_command(&entry, &fwd);
+
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(prog, "kubectl");
+        assert!(args.contains(&"port-forward".to_string()));
+        assert!(args.contains(&"--context".to_string()));
+        assert!(args.contains(&"prod".to_string()));
+        assert!(args.contains(&"-n".to_string()));
+        assert!(args.contains(&"default".to_string()));
+        assert!(args.contains(&"deployment/api".to_string()));
+        assert!(args.contains(&"127.0.0.1:8080:80".to_string()));
+    }
+
+    #[test]
+    fn test_build_kubectl_command_no_optional_fields() {
+        let entry = make_k8s_entry(None, None, K8sResourceType::Service, "postgres");
+        let fwd = make_k8s_fwd(5432, 5432);
+        let cmd = build_kubectl_command(&entry, &fwd);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(!args.contains(&"--context".to_string()));
+        assert!(!args.contains(&"-n".to_string()));
+        assert!(args.contains(&"service/postgres".to_string()));
+        assert!(args.contains(&"127.0.0.1:5432:5432".to_string()));
+    }
+
+    #[test]
+    fn test_build_kubectl_command_pod_resource() {
+        let entry = make_k8s_entry(
+            None,
+            Some("kube-system"),
+            K8sResourceType::Pod,
+            "my-pod-abc",
+        );
+        let fwd = make_k8s_fwd(9090, 9090);
+        let cmd = build_kubectl_command(&entry, &fwd);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.contains(&"pod/my-pod-abc".to_string()));
+        assert!(args.contains(&"-n".to_string()));
+        assert!(args.contains(&"kube-system".to_string()));
+    }
+
     /// Integration test: spawn a detached `sleep` process and verify the PID
     /// is alive after dropping the child handle.
     #[cfg(unix)]
@@ -183,20 +314,7 @@ mod tests {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
 
-        unsafe {
-            cmd.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-
-        let child = cmd.spawn().expect("failed to spawn sleep");
-        let pid = child.id().expect("no PID");
-
-        // Drop the child handle — the process should survive because of setsid()
-        drop(child);
+        let pid = spawn_detached_cmd(cmd).expect("failed to spawn sleep");
 
         // Give the OS a moment to register the process
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

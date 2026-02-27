@@ -46,6 +46,7 @@ impl ConnectionState {
 
 /// Events sent from tunnel supervision tasks to the app.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum TunnelEvent {
     /// SSH process has been running past the stability threshold.
     Connected { entry_id: Uuid },

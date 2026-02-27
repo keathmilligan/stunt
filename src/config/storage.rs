@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use super::model::Config;
+use super::model::{Config, ServerEntry, TunnelEntry};
 
 /// Returns the path to the tunnel configuration file.
 ///
@@ -18,8 +18,44 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(data_dir.join("tunnel-mgr").join("tunnels.toml"))
 }
 
+/// Legacy config format: a flat list of `[[server]]` entries without a `type` tag.
+///
+/// Used only for migration detection.
+#[derive(serde::Deserialize)]
+struct LegacyConfig {
+    #[serde(default)]
+    server: Vec<ServerEntry>,
+}
+
+/// Detect whether a TOML string uses the legacy `[[server]]` format (pre-migration).
+///
+/// Returns `true` if the content contains `[[server]]` table entries and no `[[entries]]`.
+fn is_legacy_format(content: &str) -> bool {
+    // Simple heuristic: check for [[server]] key at the table level.
+    // A robust check would parse the TOML value tree, but this is sufficient
+    // because the new format always uses [[entries]].
+    content.contains("[[server]]")
+}
+
+/// Migrate a legacy `[[server]]`-format config string to the new `[[entries]]` format.
+///
+/// Parses the legacy format, wraps each `ServerEntry` as `TunnelEntry::Ssh`, and
+/// serializes to the new format.
+pub fn migrate_legacy_config(content: &str) -> Result<Config> {
+    let legacy: LegacyConfig =
+        toml::from_str(content).context("failed to parse legacy config for migration")?;
+
+    let entries = legacy.server.into_iter().map(TunnelEntry::Ssh).collect();
+
+    Ok(Config { entries })
+}
+
 /// Load configuration from disk. Creates the directory and an empty config
 /// file if they do not exist.
+///
+/// If the config file uses the legacy `[[server]]` format, it is automatically
+/// migrated to the new `[[entries]]` format and written back to disk. The
+/// original file is preserved as a `.bak` before migration.
 pub fn load() -> Result<Config> {
     let path = config_path()?;
 
@@ -39,6 +75,24 @@ pub fn load() -> Result<Config> {
 
     let content = fs::read_to_string(&path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
+
+    // Detect and migrate legacy format
+    if is_legacy_format(&content) {
+        let migrated = migrate_legacy_config(&content)
+            .with_context(|| format!("failed to migrate legacy config: {}", path.display()))?;
+
+        // Back up the original before overwriting
+        let bak_path = path.with_extension("toml.bak");
+        fs::copy(&path, &bak_path)
+            .with_context(|| format!("failed to backup legacy config: {}", bak_path.display()))?;
+
+        // Save the migrated config
+        save(&migrated)
+            .with_context(|| format!("failed to save migrated config: {}", path.display()))?;
+
+        return Ok(migrated);
+    }
+
     let config: Config = toml::from_str(&content)
         .with_context(|| format!("failed to parse config file: {}", path.display()))?;
     Ok(config)
@@ -81,7 +135,7 @@ pub fn save(config: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::model::{ServerEntry, TunnelForward};
+    use crate::config::model::{ServerEntry, TunnelEntry, TunnelForward};
     use uuid::Uuid;
 
     #[test]
@@ -98,7 +152,7 @@ mod tests {
         let path = dir.join("tunnels.toml");
 
         let config = Config {
-            server: vec![ServerEntry {
+            entries: vec![TunnelEntry::Ssh(ServerEntry {
                 id: Uuid::new_v4(),
                 name: "test-server".to_string(),
                 host: "example.com".to_string(),
@@ -112,7 +166,7 @@ mod tests {
                     remote_port: 5432,
                 }],
                 auto_restart: false,
-            }],
+            })],
         };
 
         // Write directly to temp path for testing
@@ -147,5 +201,79 @@ mod tests {
 
         // Clean up
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_legacy_migration_detection() {
+        let legacy = r#"
+[[server]]
+name = "bastion"
+host = "bastion.example.com"
+"#;
+        assert!(is_legacy_format(legacy));
+
+        let modern = r#"
+[[entries]]
+type = "ssh"
+name = "bastion"
+host = "bastion.example.com"
+"#;
+        assert!(!is_legacy_format(modern));
+    }
+
+    #[test]
+    fn test_migrate_legacy_config_ssh_entries() {
+        let legacy_toml = r#"
+[[server]]
+name = "bastion"
+host = "bastion.example.com"
+port = 22
+auto_restart = false
+
+[[server]]
+name = "db-tunnel"
+host = "db.internal"
+port = 2222
+user = "deploy"
+auto_restart = true
+"#;
+
+        let migrated = migrate_legacy_config(legacy_toml).unwrap();
+        assert_eq!(migrated.entries.len(), 2);
+
+        // Both entries should be SSH type
+        assert!(matches!(migrated.entries[0], TunnelEntry::Ssh(_)));
+        assert!(matches!(migrated.entries[1], TunnelEntry::Ssh(_)));
+
+        let TunnelEntry::Ssh(first) = &migrated.entries[0] else {
+            panic!("expected SSH");
+        };
+        assert_eq!(first.name, "bastion");
+        assert_eq!(first.host, "bastion.example.com");
+
+        let TunnelEntry::Ssh(second) = &migrated.entries[1] else {
+            panic!("expected SSH");
+        };
+        assert_eq!(second.name, "db-tunnel");
+        assert_eq!(second.user, Some("deploy".to_string()));
+        assert!(second.auto_restart);
+
+        // Verify migrated config round-trips
+        let serialized = toml::to_string_pretty(&migrated).unwrap();
+        assert!(
+            !serialized.contains("[[server]]"),
+            "migrated config should not contain [[server]]"
+        );
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(migrated, reloaded);
+    }
+
+    #[test]
+    fn test_migrate_empty_legacy_config() {
+        let legacy_toml = "# empty legacy config\n";
+        // No [[server]] entries → is_legacy_format returns false, but migration
+        // should also handle it gracefully
+        let migrated = migrate_legacy_config(legacy_toml).unwrap();
+        assert!(migrated.entries.is_empty());
     }
 }

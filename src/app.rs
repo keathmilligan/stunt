@@ -6,9 +6,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::config::{self, Config, ServerEntry, TunnelForward};
+use crate::config::{
+    self, Config, K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, TunnelEntry,
+    TunnelForward,
+};
 use crate::config::{SessionRecord, SessionState, load_sessions, save_sessions};
-use crate::tunnel::{ConnectionState, Supervisor, TunnelEvent, is_live_ssh_tunnel};
+#[cfg(unix)]
+use crate::tunnel::is_live_tunnel;
+use crate::tunnel::{
+    ConnectionState, Supervisor, TunnelEvent, TunnelProcessType, build_kubectl_command,
+    build_ssh_command,
+};
 
 /// How long transient status messages are shown (in seconds).
 const STATUS_MSG_DURATION_SECS: u64 = 3;
@@ -18,8 +26,17 @@ const STATUS_MSG_DURATION_SECS: u64 = 3;
 pub enum AppMode {
     /// Normal list view.
     Normal,
-    /// Editing or creating a server entry.
+    /// Choosing the entry type for a new entry (SSH or K8s).
+    TypeSelect(EntryTypeSelection),
+    /// Editing or creating an entry.
     Form(FormState),
+}
+
+/// State for the entry-type selection step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryTypeSelection {
+    /// 0 = SSH, 1 = K8s
+    pub selected: usize,
 }
 
 /// Which section of the form currently has focus.
@@ -36,16 +53,28 @@ pub enum FormFocus {
     },
 }
 
-/// State for the server entry form (new or edit).
+/// The type of entry being edited in the form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormEntryType {
+    /// SSH server entry.
+    Ssh,
+    /// Kubernetes workload entry.
+    K8s,
+}
+
+/// State for the entry form (new or edit).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormState {
     /// Which field is currently focused in the server fields section.
     pub focused_field: usize,
     /// Whether we are editing an existing entry (Some(id)) or creating new (None).
     pub editing_id: Option<Uuid>,
-    /// Field values: name, host, port, user, identity_file.
+    /// The type of entry being edited.
+    pub entry_type: FormEntryType,
+    /// Field values for SSH: name, host, port, user, identity_file, auto_restart.
+    /// Field values for K8s: name, context, namespace, resource_name, auto_restart.
     pub fields: Vec<FormField>,
-    /// Forwards being edited.
+    /// SSH-only: forwards being edited.
     pub forwards: Vec<TunnelForward>,
     /// Which section of the form currently has focus.
     pub focus: FormFocus,
@@ -53,10 +82,13 @@ pub struct FormState {
     pub selected_forward: usize,
     /// Current forward field being edited (within the forward sub-form).
     pub forward_field: usize,
-    /// Forward type selector index (0=Local, 1=Remote, 2=Dynamic).
+    /// Forward type selector index (0=Local, 1=Remote, 2=Dynamic) for SSH.
+    /// Resource type selector index (0=Pod, 1=Service, 2=Deployment) for K8s.
     pub forward_type: usize,
-    /// Forward field values: bind_port, remote_host, remote_port.
+    /// Forward field values.
     pub forward_fields: Vec<FormField>,
+    /// K8s-only: port-forward bindings being edited.
+    pub k8s_forwards: Vec<K8sPortForward>,
 }
 
 /// A single form field.
@@ -109,8 +141,8 @@ pub enum Message {
 
 /// Core application state.
 pub struct App {
-    /// All configured server entries.
-    pub entries: Vec<ServerEntry>,
+    /// All configured tunnel entries.
+    pub entries: Vec<TunnelEntry>,
     /// Currently selected entry index.
     pub selected: usize,
     /// Scroll offset (in rows, not lines).
@@ -129,20 +161,22 @@ pub struct App {
     pub running: bool,
     /// Current app mode.
     pub mode: AppMode,
+    /// Warning message to show when kubectl is unavailable (persisted until dismissed).
+    pub kubectl_warning: Option<String>,
 }
 
 impl App {
     /// Create a new App from a loaded config and a tunnel event sender.
     pub fn new(config: Config, tunnel_tx: mpsc::UnboundedSender<TunnelEvent>) -> Self {
         let mut connection_states = HashMap::new();
-        for entry in &config.server {
-            connection_states.insert(entry.id, ConnectionState::Disconnected);
+        for entry in &config.entries {
+            connection_states.insert(entry.id(), ConnectionState::Disconnected);
         }
 
         let sessions = load_sessions();
 
         let mut app = App {
-            entries: config.server,
+            entries: config.entries,
             selected: 0,
             scroll_offset: 0,
             connection_states,
@@ -152,10 +186,16 @@ impl App {
             status_message: None,
             running: true,
             mode: AppMode::Normal,
+            kubectl_warning: None,
         };
 
         app.reconcile_sessions();
         app
+    }
+
+    /// Set a kubectl availability warning (shown in status bar).
+    pub fn set_kubectl_warning(&mut self, msg: impl Into<String>) {
+        self.kubectl_warning = Some(msg.into());
     }
 
     /// Get the active status message if it hasn't expired.
@@ -193,6 +233,7 @@ impl App {
     pub fn update(&mut self, msg: Message) {
         match self.mode {
             AppMode::Normal => self.update_normal(msg),
+            AppMode::TypeSelect(_) => self.update_type_select(msg),
             AppMode::Form(_) => self.update_form(msg),
         }
     }
@@ -211,90 +252,24 @@ impl App {
                 }
             }
             Message::NewEntry => {
-                self.mode = AppMode::Form(FormState {
-                    focused_field: 0,
-                    editing_id: None,
-                    fields: vec![
-                        FormField {
-                            label: "Name".to_string(),
-                            value: String::new(),
-                        },
-                        FormField {
-                            label: "Host".to_string(),
-                            value: String::new(),
-                        },
-                        FormField {
-                            label: "Port".to_string(),
-                            value: "22".to_string(),
-                        },
-                        FormField {
-                            label: "User".to_string(),
-                            value: String::new(),
-                        },
-                        FormField {
-                            label: "Identity File".to_string(),
-                            value: String::new(),
-                        },
-                        FormField {
-                            label: "Auto Restart".to_string(),
-                            value: "no".to_string(),
-                        },
-                    ],
-                    forwards: vec![],
-                    focus: FormFocus::ServerFields,
-                    selected_forward: 0,
-                    forward_field: 0,
-                    forward_type: 0,
-                    forward_fields: Self::default_forward_fields(),
-                });
+                // Show type-selection step before opening the full form
+                self.mode = AppMode::TypeSelect(EntryTypeSelection { selected: 0 });
             }
             Message::EditEntry => {
                 if let Some(entry) = self.entries.get(self.selected) {
-                    self.mode = AppMode::Form(FormState {
-                        focused_field: 0,
-                        editing_id: Some(entry.id),
-                        fields: vec![
-                            FormField {
-                                label: "Name".to_string(),
-                                value: entry.name.clone(),
-                            },
-                            FormField {
-                                label: "Host".to_string(),
-                                value: entry.host.clone(),
-                            },
-                            FormField {
-                                label: "Port".to_string(),
-                                value: entry.port.to_string(),
-                            },
-                            FormField {
-                                label: "User".to_string(),
-                                value: entry.user.clone().unwrap_or_default(),
-                            },
-                            FormField {
-                                label: "Identity File".to_string(),
-                                value: entry.identity_file.clone().unwrap_or_default(),
-                            },
-                            FormField {
-                                label: "Auto Restart".to_string(),
-                                value: if entry.auto_restart {
-                                    "yes".to_string()
-                                } else {
-                                    "no".to_string()
-                                },
-                            },
-                        ],
-                        forwards: entry.forwards.clone(),
-                        focus: FormFocus::ServerFields,
-                        selected_forward: 0,
-                        forward_field: 0,
-                        forward_type: 0,
-                        forward_fields: Self::default_forward_fields(),
-                    });
+                    match entry {
+                        TunnelEntry::Ssh(e) => {
+                            self.mode = AppMode::Form(Self::ssh_entry_to_form(e));
+                        }
+                        TunnelEntry::K8s(e) => {
+                            self.mode = AppMode::Form(Self::k8s_entry_to_form(e));
+                        }
+                    }
                 }
             }
             Message::DeleteEntry => {
                 if let Some(entry) = self.entries.get(self.selected) {
-                    let id = entry.id;
+                    let id = entry.id();
                     // Disconnect if active
                     if self.state_of(&id).is_active() {
                         self.disconnect(id);
@@ -313,8 +288,8 @@ impl App {
             }
             Message::ToggleConnect => {
                 if let Some(entry) = self.entries.get(self.selected) {
-                    let id = entry.id;
-                    let name = entry.name.clone();
+                    let id = entry.id();
+                    let name = entry.name().to_string();
                     let state = self.state_of(&id);
                     if state.is_active() {
                         self.disconnect(id);
@@ -341,6 +316,54 @@ impl App {
         }
     }
 
+    /// Handle messages in type-selection mode.
+    fn update_type_select(&mut self, msg: Message) {
+        let sel = match &mut self.mode {
+            AppMode::TypeSelect(s) => s,
+            _ => return,
+        };
+
+        match msg {
+            Message::NavigateUp | Message::FormPrevField => {
+                if sel.selected > 0 {
+                    sel.selected -= 1;
+                }
+            }
+            Message::NavigateDown | Message::FormNextField => {
+                if sel.selected < 1 {
+                    sel.selected += 1;
+                }
+            }
+            Message::FormCycleForwardType => {
+                // Also cycle on Ctrl+T
+                let s = match &mut self.mode {
+                    AppMode::TypeSelect(s) => s,
+                    _ => return,
+                };
+                s.selected = (s.selected + 1) % 2;
+            }
+            Message::FormSubmit => {
+                let entry_type_idx = match &self.mode {
+                    AppMode::TypeSelect(s) => s.selected,
+                    _ => return,
+                };
+                // Transition to the appropriate form
+                if entry_type_idx == 0 {
+                    self.mode = AppMode::Form(Self::new_ssh_form());
+                } else {
+                    self.mode = AppMode::Form(Self::new_k8s_form());
+                }
+            }
+            Message::FormCancel | Message::Quit => {
+                self.mode = AppMode::Normal;
+            }
+            Message::TunnelEvent(event) => {
+                self.handle_tunnel_event(event);
+            }
+            _ => {}
+        }
+    }
+
     /// Handle messages in form mode.
     fn update_form(&mut self, msg: Message) {
         let form = match &mut self.mode {
@@ -350,31 +373,56 @@ impl App {
 
         match msg {
             Message::FormNextField => {
-                match form.focus {
-                    FormFocus::ServerFields => {
-                        if form.focused_field < form.fields.len() - 1 {
-                            form.focused_field += 1;
-                        } else if !form.forwards.is_empty() {
-                            // Tab past last server field → enter forward list
-                            form.focus = FormFocus::ForwardList;
-                            form.selected_forward = 0;
+                match form.entry_type {
+                    FormEntryType::K8s => {
+                        // K8s form: simple field cycling + k8s forward list
+                        match form.focus {
+                            FormFocus::ServerFields => {
+                                if form.focused_field < form.fields.len() - 1 {
+                                    form.focused_field += 1;
+                                } else if !form.k8s_forwards.is_empty() {
+                                    form.focus = FormFocus::ForwardList;
+                                    form.selected_forward = 0;
+                                }
+                            }
+                            FormFocus::ForwardList => {
+                                if form.selected_forward < form.k8s_forwards.len().saturating_sub(1)
+                                {
+                                    form.selected_forward += 1;
+                                }
+                            }
+                            FormFocus::ForwardEdit { .. } => {
+                                if form.forward_field < 1 {
+                                    form.forward_field += 1;
+                                }
+                            }
                         }
                     }
-                    FormFocus::ForwardList => {
-                        if form.selected_forward < form.forwards.len().saturating_sub(1) {
-                            form.selected_forward += 1;
+                    FormEntryType::Ssh => match form.focus {
+                        FormFocus::ServerFields => {
+                            if form.focused_field < form.fields.len() - 1 {
+                                form.focused_field += 1;
+                            } else if !form.forwards.is_empty() {
+                                form.focus = FormFocus::ForwardList;
+                                form.selected_forward = 0;
+                            }
                         }
-                    }
-                    FormFocus::ForwardEdit { .. } => {
-                        let max = if form.forward_type == 2 { 0 } else { 2 };
-                        if form.forward_field < max {
-                            form.forward_field += 1;
+                        FormFocus::ForwardList => {
+                            if form.selected_forward < form.forwards.len().saturating_sub(1) {
+                                form.selected_forward += 1;
+                            }
                         }
-                    }
+                        FormFocus::ForwardEdit { .. } => {
+                            let max = if form.forward_type == 2 { 0 } else { 2 };
+                            if form.forward_field < max {
+                                form.forward_field += 1;
+                            }
+                        }
+                    },
                 }
             }
-            Message::FormPrevField => {
-                match form.focus {
+            Message::FormPrevField => match form.entry_type {
+                FormEntryType::K8s => match form.focus {
                     FormFocus::ServerFields => {
                         if form.focused_field > 0 {
                             form.focused_field -= 1;
@@ -384,7 +432,6 @@ impl App {
                         if form.selected_forward > 0 {
                             form.selected_forward -= 1;
                         } else {
-                            // Shift-Tab from top of forward list → back to server fields
                             form.focus = FormFocus::ServerFields;
                             form.focused_field = form.fields.len() - 1;
                         }
@@ -394,14 +441,33 @@ impl App {
                             form.forward_field -= 1;
                         }
                     }
-                }
-            }
+                },
+                FormEntryType::Ssh => match form.focus {
+                    FormFocus::ServerFields => {
+                        if form.focused_field > 0 {
+                            form.focused_field -= 1;
+                        }
+                    }
+                    FormFocus::ForwardList => {
+                        if form.selected_forward > 0 {
+                            form.selected_forward -= 1;
+                        } else {
+                            form.focus = FormFocus::ServerFields;
+                            form.focused_field = form.fields.len() - 1;
+                        }
+                    }
+                    FormFocus::ForwardEdit { .. } => {
+                        if form.forward_field > 0 {
+                            form.forward_field -= 1;
+                        }
+                    }
+                },
+            },
             Message::FormInput(ch) => {
                 match form.focus {
                     FormFocus::ServerFields => {
                         if let Some(field) = form.fields.get_mut(form.focused_field) {
                             if field.label == "Auto Restart" {
-                                // Toggle on space; ignore other characters
                                 if ch == ' ' {
                                     field.value = if field.value == "yes" {
                                         "no".to_string()
@@ -424,38 +490,32 @@ impl App {
                     }
                 }
             }
-            Message::FormBackspace => {
-                match form.focus {
-                    FormFocus::ServerFields => {
-                        if let Some(field) = form.fields.get_mut(form.focused_field) {
-                            if field.label == "Auto Restart" {
-                                // Toggle on backspace too (toggle field, not text)
-                                field.value = if field.value == "yes" {
-                                    "no".to_string()
-                                } else {
-                                    "yes".to_string()
-                                };
+            Message::FormBackspace => match form.focus {
+                FormFocus::ServerFields => {
+                    if let Some(field) = form.fields.get_mut(form.focused_field) {
+                        if field.label == "Auto Restart" {
+                            field.value = if field.value == "yes" {
+                                "no".to_string()
                             } else {
-                                field.value.pop();
-                            }
-                        }
-                    }
-                    FormFocus::ForwardList => {
-                        // No text input while browsing the forward list
-                    }
-                    FormFocus::ForwardEdit { .. } => {
-                        if let Some(field) = form.forward_fields.get_mut(form.forward_field) {
+                                "yes".to_string()
+                            };
+                        } else {
                             field.value.pop();
                         }
                     }
                 }
-            }
-            Message::FormAddForward => {
-                match form.focus {
+                FormFocus::ForwardList => {}
+                FormFocus::ForwardEdit { .. } => {
+                    if let Some(field) = form.forward_fields.get_mut(form.forward_field) {
+                        field.value.pop();
+                    }
+                }
+            },
+            Message::FormAddForward => match form.entry_type {
+                FormEntryType::Ssh => match form.focus {
                     FormFocus::ForwardEdit { .. } => {
-                        // Commit current forward, then start a new one
-                        if let Some(fwd) = self.build_forward_from_form() {
-                            self.commit_forward(fwd);
+                        if let Some(fwd) = self.build_ssh_forward_from_form() {
+                            self.commit_ssh_forward(fwd);
                             let form = match &mut self.mode {
                                 AppMode::Form(f) => f,
                                 _ => return,
@@ -465,24 +525,45 @@ impl App {
                             };
                             form.forward_field = 0;
                             form.forward_type = 0;
-                            form.forward_fields = Self::default_forward_fields();
+                            form.forward_fields = Self::default_ssh_forward_fields();
                         }
                     }
                     _ => {
-                        // Start adding a new forward
                         form.focus = FormFocus::ForwardEdit {
                             editing_index: None,
                         };
                         form.forward_field = 0;
                         form.forward_type = 0;
-                        form.forward_fields = Self::default_forward_fields();
+                        form.forward_fields = Self::default_ssh_forward_fields();
                     }
-                }
-            }
-            Message::FormDeleteForward => {
-                match form.focus {
+                },
+                FormEntryType::K8s => match form.focus {
                     FormFocus::ForwardEdit { .. } => {
-                        // Cancel forward editing, return to list or server fields
+                        if let Some(fwd) = self.build_k8s_forward_from_form() {
+                            self.commit_k8s_forward(fwd);
+                            let form = match &mut self.mode {
+                                AppMode::Form(f) => f,
+                                _ => return,
+                            };
+                            form.focus = FormFocus::ForwardEdit {
+                                editing_index: None,
+                            };
+                            form.forward_field = 0;
+                            form.forward_fields = Self::default_k8s_forward_fields();
+                        }
+                    }
+                    _ => {
+                        form.focus = FormFocus::ForwardEdit {
+                            editing_index: None,
+                        };
+                        form.forward_field = 0;
+                        form.forward_fields = Self::default_k8s_forward_fields();
+                    }
+                },
+            },
+            Message::FormDeleteForward => match form.focus {
+                FormFocus::ForwardEdit { .. } => match form.entry_type {
+                    FormEntryType::Ssh => {
                         if form.forwards.is_empty() {
                             form.focus = FormFocus::ServerFields;
                         } else {
@@ -492,8 +573,19 @@ impl App {
                             form.focus = FormFocus::ForwardList;
                         }
                     }
-                    FormFocus::ForwardList => {
-                        // Delete the selected forward
+                    FormEntryType::K8s => {
+                        if form.k8s_forwards.is_empty() {
+                            form.focus = FormFocus::ServerFields;
+                        } else {
+                            form.selected_forward = form
+                                .selected_forward
+                                .min(form.k8s_forwards.len().saturating_sub(1));
+                            form.focus = FormFocus::ForwardList;
+                        }
+                    }
+                },
+                FormFocus::ForwardList => match form.entry_type {
+                    FormEntryType::Ssh => {
                         if !form.forwards.is_empty() {
                             form.forwards.remove(form.selected_forward);
                             if form.forwards.is_empty() {
@@ -506,16 +598,35 @@ impl App {
                             }
                         }
                     }
-                    FormFocus::ServerFields => {
-                        // Nothing to delete from server fields context
+                    FormEntryType::K8s => {
+                        if !form.k8s_forwards.is_empty() {
+                            form.k8s_forwards.remove(form.selected_forward);
+                            if form.k8s_forwards.is_empty() {
+                                form.focus = FormFocus::ServerFields;
+                                form.focused_field = form.fields.len() - 1;
+                            } else {
+                                form.selected_forward = form
+                                    .selected_forward
+                                    .min(form.k8s_forwards.len().saturating_sub(1));
+                            }
+                        }
                     }
-                }
-            }
+                },
+                FormFocus::ServerFields => {}
+            },
             Message::FormCycleForwardType => {
                 if matches!(form.focus, FormFocus::ForwardEdit { .. }) {
-                    form.forward_type = (form.forward_type + 1) % 3;
-                    form.forward_fields = Self::default_forward_fields();
-                    form.forward_field = 0;
+                    match form.entry_type {
+                        FormEntryType::Ssh => {
+                            form.forward_type = (form.forward_type + 1) % 3;
+                            form.forward_fields = Self::default_ssh_forward_fields();
+                            form.forward_field = 0;
+                        }
+                        FormEntryType::K8s => {
+                            // K8s resource type cycling (pod/service/deployment) is handled
+                            // in the server fields (a dedicated field), not in forward sub-form.
+                        }
+                    }
                 }
             }
             Message::FormSubmit => {
@@ -523,36 +634,69 @@ impl App {
                     AppMode::Form(ref form)
                         if matches!(form.focus, FormFocus::ForwardEdit { .. }) =>
                     {
-                        // Commit the forward being edited
-                        if let Some(fwd) = self.build_forward_from_form() {
-                            self.commit_forward(fwd);
-                            // Return to forward list
-                            let form = match &mut self.mode {
-                                AppMode::Form(f) => f,
-                                _ => return,
-                            };
-                            form.selected_forward = form
-                                .selected_forward
-                                .min(form.forwards.len().saturating_sub(1));
-                            form.focus = FormFocus::ForwardList;
+                        match form.entry_type {
+                            FormEntryType::Ssh => {
+                                if let Some(fwd) = self.build_ssh_forward_from_form() {
+                                    self.commit_ssh_forward(fwd);
+                                    let form = match &mut self.mode {
+                                        AppMode::Form(f) => f,
+                                        _ => return,
+                                    };
+                                    form.selected_forward = form
+                                        .selected_forward
+                                        .min(form.forwards.len().saturating_sub(1));
+                                    form.focus = FormFocus::ForwardList;
+                                }
+                            }
+                            FormEntryType::K8s => {
+                                if let Some(fwd) = self.build_k8s_forward_from_form() {
+                                    self.commit_k8s_forward(fwd);
+                                    let form = match &mut self.mode {
+                                        AppMode::Form(f) => f,
+                                        _ => return,
+                                    };
+                                    form.selected_forward = form
+                                        .selected_forward
+                                        .min(form.k8s_forwards.len().saturating_sub(1));
+                                    form.focus = FormFocus::ForwardList;
+                                }
+                            }
                         }
                         return;
                     }
                     AppMode::Form(ref form) if matches!(form.focus, FormFocus::ForwardList) => {
-                        // Enter on a selected forward → open it for editing
-                        let idx = form.selected_forward;
-                        if let Some(fwd) = form.forwards.get(idx) {
-                            let (ftype, fields) = Self::forward_to_fields(fwd);
-                            let form = match &mut self.mode {
-                                AppMode::Form(f) => f,
-                                _ => return,
-                            };
-                            form.focus = FormFocus::ForwardEdit {
-                                editing_index: Some(idx),
-                            };
-                            form.forward_type = ftype;
-                            form.forward_fields = fields;
-                            form.forward_field = 0;
+                        match form.entry_type {
+                            FormEntryType::Ssh => {
+                                let idx = form.selected_forward;
+                                if let Some(fwd) = form.forwards.get(idx) {
+                                    let (ftype, fields) = Self::ssh_forward_to_fields(fwd);
+                                    let form = match &mut self.mode {
+                                        AppMode::Form(f) => f,
+                                        _ => return,
+                                    };
+                                    form.focus = FormFocus::ForwardEdit {
+                                        editing_index: Some(idx),
+                                    };
+                                    form.forward_type = ftype;
+                                    form.forward_fields = fields;
+                                    form.forward_field = 0;
+                                }
+                            }
+                            FormEntryType::K8s => {
+                                let idx = form.selected_forward;
+                                if let Some(fwd) = form.k8s_forwards.get(idx) {
+                                    let fields = Self::k8s_forward_to_fields(fwd);
+                                    let form = match &mut self.mode {
+                                        AppMode::Form(f) => f,
+                                        _ => return,
+                                    };
+                                    form.focus = FormFocus::ForwardEdit {
+                                        editing_index: Some(idx),
+                                    };
+                                    form.forward_fields = fields;
+                                    form.forward_field = 0;
+                                }
+                            }
                         }
                         return;
                     }
@@ -561,19 +705,25 @@ impl App {
                 self.submit_form();
             }
             Message::FormCancel => {
-                // If editing a forward, cancel back to list; otherwise cancel form entirely
                 let form = match &mut self.mode {
                     AppMode::Form(f) => f,
                     _ => return,
                 };
                 match form.focus {
                     FormFocus::ForwardEdit { .. } => {
-                        if form.forwards.is_empty() {
+                        let is_empty = match form.entry_type {
+                            FormEntryType::Ssh => form.forwards.is_empty(),
+                            FormEntryType::K8s => form.k8s_forwards.is_empty(),
+                        };
+                        if is_empty {
                             form.focus = FormFocus::ServerFields;
                         } else {
-                            form.selected_forward = form
-                                .selected_forward
-                                .min(form.forwards.len().saturating_sub(1));
+                            let len = match form.entry_type {
+                                FormEntryType::Ssh => form.forwards.len(),
+                                FormEntryType::K8s => form.k8s_forwards.len(),
+                            };
+                            form.selected_forward =
+                                form.selected_forward.min(len.saturating_sub(1));
                             form.focus = FormFocus::ForwardList;
                         }
                     }
@@ -582,12 +732,195 @@ impl App {
                     }
                 }
             }
+            Message::TunnelEvent(event) => {
+                self.handle_tunnel_event(event);
+            }
             _ => {}
         }
     }
 
-    /// Commit a built forward to the form, handling insert vs. replace.
-    fn commit_forward(&mut self, fwd: TunnelForward) {
+    // ── Form builders ──────────────────────────────────────────────────────
+
+    /// Build a new empty SSH entry form.
+    fn new_ssh_form() -> FormState {
+        FormState {
+            focused_field: 0,
+            editing_id: None,
+            entry_type: FormEntryType::Ssh,
+            fields: vec![
+                FormField {
+                    label: "Name".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Host".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Port".to_string(),
+                    value: "22".to_string(),
+                },
+                FormField {
+                    label: "User".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Identity File".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Auto Restart".to_string(),
+                    value: "no".to_string(),
+                },
+            ],
+            forwards: vec![],
+            focus: FormFocus::ServerFields,
+            selected_forward: 0,
+            forward_field: 0,
+            forward_type: 0,
+            forward_fields: Self::default_ssh_forward_fields(),
+            k8s_forwards: vec![],
+        }
+    }
+
+    /// Build a new empty K8s entry form.
+    fn new_k8s_form() -> FormState {
+        FormState {
+            focused_field: 0,
+            editing_id: None,
+            entry_type: FormEntryType::K8s,
+            fields: vec![
+                FormField {
+                    label: "Name".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Context".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Namespace".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Resource Type".to_string(),
+                    value: "deployment".to_string(),
+                },
+                FormField {
+                    label: "Resource Name".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Auto Restart".to_string(),
+                    value: "no".to_string(),
+                },
+            ],
+            forwards: vec![],
+            focus: FormFocus::ServerFields,
+            selected_forward: 0,
+            forward_field: 0,
+            forward_type: 0,
+            forward_fields: Self::default_k8s_forward_fields(),
+            k8s_forwards: vec![],
+        }
+    }
+
+    /// Build a form pre-populated from an existing SSH entry.
+    fn ssh_entry_to_form(entry: &ServerEntry) -> FormState {
+        FormState {
+            focused_field: 0,
+            editing_id: Some(entry.id),
+            entry_type: FormEntryType::Ssh,
+            fields: vec![
+                FormField {
+                    label: "Name".to_string(),
+                    value: entry.name.clone(),
+                },
+                FormField {
+                    label: "Host".to_string(),
+                    value: entry.host.clone(),
+                },
+                FormField {
+                    label: "Port".to_string(),
+                    value: entry.port.to_string(),
+                },
+                FormField {
+                    label: "User".to_string(),
+                    value: entry.user.clone().unwrap_or_default(),
+                },
+                FormField {
+                    label: "Identity File".to_string(),
+                    value: entry.identity_file.clone().unwrap_or_default(),
+                },
+                FormField {
+                    label: "Auto Restart".to_string(),
+                    value: if entry.auto_restart {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                },
+            ],
+            forwards: entry.forwards.clone(),
+            focus: FormFocus::ServerFields,
+            selected_forward: 0,
+            forward_field: 0,
+            forward_type: 0,
+            forward_fields: Self::default_ssh_forward_fields(),
+            k8s_forwards: vec![],
+        }
+    }
+
+    /// Build a form pre-populated from an existing K8s entry.
+    fn k8s_entry_to_form(entry: &K8sEntry) -> FormState {
+        FormState {
+            focused_field: 0,
+            editing_id: Some(entry.id),
+            entry_type: FormEntryType::K8s,
+            fields: vec![
+                FormField {
+                    label: "Name".to_string(),
+                    value: entry.name.clone(),
+                },
+                FormField {
+                    label: "Context".to_string(),
+                    value: entry.context.clone().unwrap_or_default(),
+                },
+                FormField {
+                    label: "Namespace".to_string(),
+                    value: entry.namespace.clone().unwrap_or_default(),
+                },
+                FormField {
+                    label: "Resource Type".to_string(),
+                    value: entry.resource_type.as_str().to_string(),
+                },
+                FormField {
+                    label: "Resource Name".to_string(),
+                    value: entry.resource_name.clone(),
+                },
+                FormField {
+                    label: "Auto Restart".to_string(),
+                    value: if entry.auto_restart {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                },
+            ],
+            forwards: vec![],
+            focus: FormFocus::ServerFields,
+            selected_forward: 0,
+            forward_field: 0,
+            forward_type: 0,
+            forward_fields: Self::default_k8s_forward_fields(),
+            k8s_forwards: entry.forwards.clone(),
+        }
+    }
+
+    // ── SSH forward helpers ────────────────────────────────────────────────
+
+    /// Commit a built SSH forward to the form.
+    fn commit_ssh_forward(&mut self, fwd: TunnelForward) {
         let form = match &mut self.mode {
             AppMode::Form(f) => f,
             _ => return,
@@ -604,12 +937,6 @@ impl App {
                     form.selected_forward = form.forwards.len() - 1;
                 }
             }
-            FormFocus::ForwardEdit {
-                editing_index: None,
-            } => {
-                form.forwards.push(fwd);
-                form.selected_forward = form.forwards.len() - 1;
-            }
             _ => {
                 form.forwards.push(fwd);
                 form.selected_forward = form.forwards.len() - 1;
@@ -617,8 +944,8 @@ impl App {
         }
     }
 
-    /// Extract forward type index and form fields from an existing forward.
-    fn forward_to_fields(fwd: &TunnelForward) -> (usize, Vec<FormField>) {
+    /// Extract SSH forward type index and form fields from an existing forward.
+    fn ssh_forward_to_fields(fwd: &TunnelForward) -> (usize, Vec<FormField>) {
         match fwd {
             TunnelForward::Local {
                 bind_port,
@@ -684,8 +1011,8 @@ impl App {
         }
     }
 
-    /// Build a TunnelForward from current form state.
-    fn build_forward_from_form(&self) -> Option<TunnelForward> {
+    /// Build a `TunnelForward` from the current form state.
+    fn build_ssh_forward_from_form(&self) -> Option<TunnelForward> {
         let form = match &self.mode {
             AppMode::Form(f) => f,
             _ => return None,
@@ -695,7 +1022,6 @@ impl App {
 
         match form.forward_type {
             0 => {
-                // Local
                 let remote_host = form.forward_fields.get(1)?.value.clone();
                 let remote_port: u16 = form.forward_fields.get(2)?.value.parse().ok()?;
                 if remote_host.is_empty() {
@@ -709,7 +1035,6 @@ impl App {
                 })
             }
             1 => {
-                // Remote
                 let remote_host = form.forward_fields.get(1)?.value.clone();
                 let remote_port: u16 = form.forward_fields.get(2)?.value.parse().ok()?;
                 if remote_host.is_empty() {
@@ -722,19 +1047,16 @@ impl App {
                     remote_port,
                 })
             }
-            2 => {
-                // Dynamic
-                Some(TunnelForward::Dynamic {
-                    bind_address: "127.0.0.1".to_string(),
-                    bind_port,
-                })
-            }
+            2 => Some(TunnelForward::Dynamic {
+                bind_address: "127.0.0.1".to_string(),
+                bind_port,
+            }),
             _ => None,
         }
     }
 
-    /// Default fields for the forward sub-form.
-    fn default_forward_fields() -> Vec<FormField> {
+    /// Default fields for the SSH forward sub-form.
+    fn default_ssh_forward_fields() -> Vec<FormField> {
         vec![
             FormField {
                 label: "Bind Port".to_string(),
@@ -751,6 +1073,80 @@ impl App {
         ]
     }
 
+    // ── K8s forward helpers ────────────────────────────────────────────────
+
+    /// Commit a built K8s forward to the form.
+    fn commit_k8s_forward(&mut self, fwd: K8sPortForward) {
+        let form = match &mut self.mode {
+            AppMode::Form(f) => f,
+            _ => return,
+        };
+        match form.focus {
+            FormFocus::ForwardEdit {
+                editing_index: Some(idx),
+            } => {
+                if idx < form.k8s_forwards.len() {
+                    form.k8s_forwards[idx] = fwd;
+                    form.selected_forward = idx;
+                } else {
+                    form.k8s_forwards.push(fwd);
+                    form.selected_forward = form.k8s_forwards.len() - 1;
+                }
+            }
+            _ => {
+                form.k8s_forwards.push(fwd);
+                form.selected_forward = form.k8s_forwards.len() - 1;
+            }
+        }
+    }
+
+    /// Extract K8s forward form fields from an existing binding.
+    fn k8s_forward_to_fields(fwd: &K8sPortForward) -> Vec<FormField> {
+        vec![
+            FormField {
+                label: "Local Port".to_string(),
+                value: fwd.local_port.to_string(),
+            },
+            FormField {
+                label: "Remote Port".to_string(),
+                value: fwd.remote_port.to_string(),
+            },
+        ]
+    }
+
+    /// Build a `K8sPortForward` from the current form state.
+    fn build_k8s_forward_from_form(&self) -> Option<K8sPortForward> {
+        let form = match &self.mode {
+            AppMode::Form(f) => f,
+            _ => return None,
+        };
+
+        let local_port: u16 = form.forward_fields.first()?.value.parse().ok()?;
+        let remote_port: u16 = form.forward_fields.get(1)?.value.parse().ok()?;
+
+        Some(K8sPortForward {
+            local_bind_address: "127.0.0.1".to_string(),
+            local_port,
+            remote_port,
+        })
+    }
+
+    /// Default fields for the K8s forward sub-form.
+    fn default_k8s_forward_fields() -> Vec<FormField> {
+        vec![
+            FormField {
+                label: "Local Port".to_string(),
+                value: String::new(),
+            },
+            FormField {
+                label: "Remote Port".to_string(),
+                value: String::new(),
+            },
+        ]
+    }
+
+    // ── Form submission ────────────────────────────────────────────────────
+
     /// Submit the form and create/update the entry.
     fn submit_form(&mut self) {
         let form = match &self.mode {
@@ -758,6 +1154,14 @@ impl App {
             _ => return,
         };
 
+        match form.entry_type {
+            FormEntryType::Ssh => self.submit_ssh_form(form),
+            FormEntryType::K8s => self.submit_k8s_form(form),
+        }
+    }
+
+    /// Submit an SSH entry form.
+    fn submit_ssh_form(&mut self, form: FormState) {
         let name = form.fields[0].value.trim().to_string();
         let host = form.fields[1].value.trim().to_string();
         let port: u16 = form.fields[2].value.trim().parse().unwrap_or(22);
@@ -777,21 +1181,21 @@ impl App {
         }
 
         if let Some(id) = form.editing_id {
-            // Update existing entry
-            if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
-                entry.name = name;
-                entry.host = host;
-                entry.port = port;
-                entry.user = user;
-                entry.identity_file = identity_file;
-                entry.forwards = form.forwards;
-                entry.auto_restart = auto_restart;
+            if let Some(entry) = self.entries.iter_mut().find(|e| e.id() == id)
+                && let TunnelEntry::Ssh(ssh) = entry
+            {
+                ssh.name = name;
+                ssh.host = host;
+                ssh.port = port;
+                ssh.user = user;
+                ssh.identity_file = identity_file;
+                ssh.forwards = form.forwards;
+                ssh.auto_restart = auto_restart;
             }
             self.set_status("Entry updated");
         } else {
-            // Create new entry
             let id = Uuid::new_v4();
-            let entry = ServerEntry {
+            let entry = TunnelEntry::Ssh(ServerEntry {
                 id,
                 name,
                 host,
@@ -800,7 +1204,7 @@ impl App {
                 identity_file,
                 forwards: form.forwards,
                 auto_restart,
-            };
+            });
             self.entries.push(entry);
             self.connection_states
                 .insert(id, ConnectionState::Disconnected);
@@ -812,18 +1216,115 @@ impl App {
         self.mode = AppMode::Normal;
     }
 
+    /// Submit a K8s entry form.
+    fn submit_k8s_form(&mut self, form: FormState) {
+        let name = form.fields[0].value.trim().to_string();
+        let context = {
+            let val = form.fields[1].value.trim().to_string();
+            if val.is_empty() { None } else { Some(val) }
+        };
+        let namespace = {
+            let val = form.fields[2].value.trim().to_string();
+            if val.is_empty() { None } else { Some(val) }
+        };
+        let resource_type_str = form.fields[3].value.trim().to_lowercase();
+        let resource_type = match resource_type_str.as_str() {
+            "pod" => K8sResourceType::Pod,
+            "service" => K8sResourceType::Service,
+            _ => K8sResourceType::Deployment,
+        };
+        let resource_name = form.fields[4].value.trim().to_string();
+        let auto_restart = form.fields[5].value.trim().eq_ignore_ascii_case("yes");
+
+        if name.is_empty() || resource_name.is_empty() {
+            self.set_status("Name and Resource Name are required");
+            return;
+        }
+
+        if let Some(id) = form.editing_id {
+            if let Some(entry) = self.entries.iter_mut().find(|e| e.id() == id)
+                && let TunnelEntry::K8s(k8s) = entry
+            {
+                k8s.name = name;
+                k8s.context = context;
+                k8s.namespace = namespace;
+                k8s.resource_type = resource_type;
+                k8s.resource_name = resource_name;
+                k8s.forwards = form.k8s_forwards;
+                k8s.auto_restart = auto_restart;
+            }
+            self.set_status("Entry updated");
+        } else {
+            let id = Uuid::new_v4();
+            let entry = TunnelEntry::K8s(K8sEntry {
+                id,
+                name,
+                context,
+                namespace,
+                resource_type,
+                resource_name,
+                forwards: form.k8s_forwards,
+                auto_restart,
+            });
+            self.entries.push(entry);
+            self.connection_states
+                .insert(id, ConnectionState::Disconnected);
+            self.selected = self.entries.len() - 1;
+            self.set_status("Entry created");
+        }
+
+        self.save_config();
+        self.mode = AppMode::Normal;
+    }
+
+    // ── Connection management ──────────────────────────────────────────────
+
     /// Initiate a connection for the entry at the given index.
     fn connect(&mut self, index: usize) {
         let entry = match self.entries.get(index) {
             Some(e) => e.clone(),
             None => return,
         };
-        let id = entry.id;
+        let id = entry.id();
 
         self.connection_states
             .insert(id, ConnectionState::Connecting);
 
-        let supervisor = Supervisor::spawn(entry, self.tunnel_tx.clone());
+        let supervisor = match &entry {
+            TunnelEntry::Ssh(ssh_entry) => {
+                let ssh_entry = ssh_entry.clone();
+                Supervisor::spawn(
+                    id,
+                    ssh_entry.auto_restart,
+                    TunnelProcessType::Ssh,
+                    Box::new(move || build_ssh_command(&ssh_entry)),
+                    self.tunnel_tx.clone(),
+                )
+            }
+            TunnelEntry::K8s(k8s_entry) => {
+                // Spawn one supervisor per K8s port-forward binding.
+                // If there are no forwards yet, spawn a single connection using an empty
+                // kubectl command (which will fail quickly) so the user sees a Failed state.
+                if k8s_entry.forwards.is_empty() {
+                    // No bindings — use the first forward (none) for a placeholder supervisor
+                    // that will immediately fail. The user must add a forward binding first.
+                    self.set_status("No port-forward bindings configured");
+                    self.connection_states.insert(id, ConnectionState::Failed);
+                    return;
+                }
+                // Spawn for the first forward only; additional forwards would need
+                // separate supervisor tracking — deferred to future multi-forward support.
+                let forward = k8s_entry.forwards[0].clone();
+                let k8s_entry = k8s_entry.clone();
+                Supervisor::spawn(
+                    id,
+                    k8s_entry.auto_restart,
+                    TunnelProcessType::Kubectl,
+                    Box::new(move || build_kubectl_command(&k8s_entry, &forward)),
+                    self.tunnel_tx.clone(),
+                )
+            }
+        };
 
         // Record session immediately (PID will be updated via PidUpdate event)
         self.sessions.insert(
@@ -844,17 +1345,15 @@ impl App {
         let auto_restart = self
             .entries
             .iter()
-            .find(|e| e.id == id)
-            .is_some_and(|e| e.auto_restart);
+            .find(|e| e.id() == id)
+            .is_some_and(|e| e.auto_restart());
 
         if let Some(supervisor) = self.supervisors.remove(&id) {
-            // Signal the supervisor to stop reconnecting before killing
             supervisor.set_suspended(true);
             supervisor.cancel_and_kill();
         }
 
         if auto_restart {
-            // Suspended: tunnel is intentionally stopped, suppress auto-reconnect
             self.connection_states
                 .insert(id, ConnectionState::Suspended);
             self.sessions.insert(
@@ -880,41 +1379,36 @@ impl App {
                 self.connection_states
                     .insert(entry_id, ConnectionState::Connected);
 
-                // Update session record with connected_at timestamp
                 if let Some(record) = self.sessions.get_mut(&entry_id) {
                     record.connected_at = Some(Self::now_timestamp());
                 }
                 self.persist_sessions();
 
-                if let Some(entry) = self.entries.iter().find(|e| e.id == entry_id) {
-                    self.set_status(format!("Connected: {}", entry.name));
+                if let Some(entry) = self.entries.iter().find(|e| e.id() == entry_id) {
+                    self.set_status(format!("Connected: {}", entry.name()));
                 }
             }
             TunnelEvent::Disconnected { entry_id } => {
-                // The SSH process died unexpectedly (detected by PID polling).
                 let auto_restart = self
                     .entries
                     .iter()
-                    .find(|e| e.id == entry_id)
-                    .is_some_and(|e| e.auto_restart);
+                    .find(|e| e.id() == entry_id)
+                    .is_some_and(|e| e.auto_restart());
 
                 if auto_restart {
-                    // Supervisor is still alive and will attempt reconnection.
-                    // Show Failed briefly; supervisor will send Reconnecting next.
                     self.connection_states
                         .insert(entry_id, ConnectionState::Failed);
-                    if let Some(entry) = self.entries.iter().find(|e| e.id == entry_id) {
-                        self.set_status(format!("Connection lost: {}", entry.name));
+                    if let Some(entry) = self.entries.iter().find(|e| e.id() == entry_id) {
+                        self.set_status(format!("Connection lost: {}", entry.name()));
                     }
                 } else {
-                    // Supervisor task has exited — clean up everything.
                     self.connection_states
                         .insert(entry_id, ConnectionState::Failed);
                     self.supervisors.remove(&entry_id);
                     self.sessions.remove(&entry_id);
                     self.persist_sessions();
-                    if let Some(entry) = self.entries.iter().find(|e| e.id == entry_id) {
-                        self.set_status(format!("Connection lost: {}", entry.name));
+                    if let Some(entry) = self.entries.iter().find(|e| e.id() == entry_id) {
+                        self.set_status(format!("Connection lost: {}", entry.name()));
                     }
                 }
             }
@@ -933,15 +1427,16 @@ impl App {
             } => {
                 self.connection_states
                     .insert(entry_id, ConnectionState::Reconnecting);
-                if let Some(entry) = self.entries.iter().find(|e| e.id == entry_id) {
+                if let Some(entry) = self.entries.iter().find(|e| e.id() == entry_id) {
                     self.set_status(format!(
                         "Reconnecting {} (attempt {}, {}s delay)",
-                        entry.name, attempt, delay_secs
+                        entry.name(),
+                        attempt,
+                        delay_secs
                     ));
                 }
             }
             TunnelEvent::PidUpdate { entry_id, pid } => {
-                // Update session record with the new PID
                 let record = self.sessions.entry(entry_id).or_insert(SessionRecord {
                     pid: None,
                     suspended: false,
@@ -954,25 +1449,14 @@ impl App {
     }
 
     /// Reconcile session state on startup.
-    ///
-    /// For each session record from the previous run:
-    /// - Suspended records → set `ConnectionState::Suspended`
-    /// - Live SSH PIDs → set `Connected`, adopt with a polling supervisor
-    /// - Dead PIDs with `auto_restart` → initiate new connection
-    /// - Dead PIDs without `auto_restart` → set `Disconnected`, remove record
-    /// - Stale records (UUID not in config) → remove
     fn reconcile_sessions(&mut self) {
         let entry_ids: std::collections::HashSet<Uuid> =
-            self.entries.iter().map(|e| e.id).collect();
+            self.entries.iter().map(|e| e.id()).collect();
 
-        // Collect session keys to iterate (avoid borrow issues)
         let session_ids: Vec<Uuid> = self.sessions.keys().cloned().collect();
-
-        // Track which entries to auto-connect after reconciliation
         let mut auto_connect: Vec<usize> = Vec::new();
 
         for id in session_ids {
-            // Remove stale records whose UUID doesn't match any config entry
             if !entry_ids.contains(&id) {
                 self.sessions.remove(&id);
                 continue;
@@ -984,59 +1468,97 @@ impl App {
             };
 
             if record.suspended {
-                // Suspended: set state, no PID check needed
                 self.connection_states
                     .insert(id, ConnectionState::Suspended);
                 continue;
             }
 
+            // Determine process type for liveness check (used on unix only)
+            let _process_type = self
+                .entries
+                .iter()
+                .find(|e| e.id() == id)
+                .map(|e| match e {
+                    TunnelEntry::Ssh(_) => TunnelProcessType::Ssh,
+                    TunnelEntry::K8s(_) => TunnelProcessType::Kubectl,
+                })
+                .unwrap_or(TunnelProcessType::Ssh);
+
+            #[cfg(unix)]
             if let Some(pid) = record.pid
-                && is_live_ssh_tunnel(pid)
+                && is_live_tunnel(pid, _process_type)
             {
-                // PID alive and is ssh → adopt it
+                // PID alive — adopt it
                 self.connection_states
                     .insert(id, ConnectionState::Connected);
-                let entry = match self.entries.iter().find(|e| e.id == id) {
+                let entry = match self.entries.iter().find(|e| e.id() == id) {
                     Some(e) => e.clone(),
                     None => continue,
                 };
-                let supervisor = Supervisor::adopt(entry, pid, self.tunnel_tx.clone());
+                let auto_restart = entry.auto_restart();
+
+                let supervisor = match &entry {
+                    TunnelEntry::Ssh(ssh) => {
+                        let ssh = ssh.clone();
+                        Supervisor::adopt(
+                            id,
+                            pid,
+                            auto_restart,
+                            TunnelProcessType::Ssh,
+                            Box::new(move || build_ssh_command(&ssh)),
+                            self.tunnel_tx.clone(),
+                        )
+                    }
+                    TunnelEntry::K8s(k8s) => {
+                        if k8s.forwards.is_empty() {
+                            continue;
+                        }
+                        let forward = k8s.forwards[0].clone();
+                        let k8s = k8s.clone();
+                        Supervisor::adopt(
+                            id,
+                            pid,
+                            auto_restart,
+                            TunnelProcessType::Kubectl,
+                            Box::new(move || build_kubectl_command(&k8s, &forward)),
+                            self.tunnel_tx.clone(),
+                        )
+                    }
+                };
                 self.supervisors.insert(id, supervisor);
                 continue;
             }
 
             // PID is dead (or no PID recorded) — check auto_restart
-            let entry = self.entries.iter().find(|e| e.id == id);
-            let auto_restart = entry.is_some_and(|e| e.auto_restart);
+            let auto_restart = self
+                .entries
+                .iter()
+                .find(|e| e.id() == id)
+                .is_some_and(|e| e.auto_restart());
 
             if auto_restart {
-                // Will auto-connect after reconciliation loop
-                if let Some(idx) = self.entries.iter().position(|e| e.id == id) {
+                if let Some(idx) = self.entries.iter().position(|e| e.id() == id) {
                     auto_connect.push(idx);
                 }
-                // Remove the stale session record — connect() will create a fresh one
                 self.sessions.remove(&id);
             } else {
-                // No auto-restart: mark disconnected and remove session
                 self.connection_states
                     .insert(id, ConnectionState::Disconnected);
                 self.sessions.remove(&id);
             }
         }
 
-        // Auto-connect dead auto_restart tunnels
         for idx in auto_connect {
             self.connect(idx);
         }
 
-        // Save cleaned session state
         self.persist_sessions();
     }
 
     /// Save the current entries to disk.
     fn save_config(&self) {
         let cfg = Config {
-            server: self.entries.clone(),
+            entries: self.entries.clone(),
         };
         if let Err(e) = config::save(&cfg) {
             eprintln!("Failed to save config: {e}");

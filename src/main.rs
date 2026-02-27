@@ -17,6 +17,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use app::{App, AppMode, Message};
+use config::TunnelEntry;
 use event::AppEvent;
 
 #[tokio::main]
@@ -31,7 +32,16 @@ async fn main() -> anyhow::Result<()> {
     let (tunnel_tx, mut app_rx) = event::start_event_loop();
 
     // Create the application
-    let mut app = App::new(cfg, tunnel_tx);
+    let mut app = App::new(cfg.clone(), tunnel_tx);
+
+    // Warn if kubectl is unavailable and K8s entries are configured
+    let has_k8s_entries = cfg.entries.iter().any(|e| matches!(e, TunnelEntry::K8s(_)));
+    if has_k8s_entries && !tunnel::check_kubectl_available() {
+        app.set_kubectl_warning(
+            "kubectl not found on PATH — K8s tunnels unavailable. Install kubectl to use K8s entries."
+                .to_string(),
+        );
+    }
 
     // Initialize terminal
     enable_raw_mode()?;
@@ -63,6 +73,20 @@ async fn main() -> anyhow::Result<()> {
                             KeyCode::Char('d') => Some(Message::DeleteEntry),
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 Some(Message::Quit)
+                            }
+                            _ => None,
+                        },
+                        AppMode::TypeSelect(_) => match key.code {
+                            KeyCode::Esc => Some(Message::FormCancel),
+                            KeyCode::Enter => Some(Message::FormSubmit),
+                            KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
+                                Some(Message::FormNextField)
+                            }
+                            KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k') => {
+                                Some(Message::FormPrevField)
+                            }
+                            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                Some(Message::FormCycleForwardType)
                             }
                             _ => None,
                         },

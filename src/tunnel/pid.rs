@@ -1,9 +1,19 @@
-//! PID liveness checks for detached SSH tunnel processes.
+//! PID liveness checks for detached tunnel processes.
 //!
-//! Provides functions to verify that a process is alive and is actually an
-//! `ssh` process (not a recycled PID running something else).
+//! Provides functions to verify that a process is alive and is actually the
+//! expected tunnel process type (`ssh` or `kubectl`), not a recycled PID
+//! running something else.
 
 use std::fs;
+
+/// The type of tunnel process being supervised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelProcessType {
+    /// An SSH tunnel process (`ssh` binary).
+    Ssh,
+    /// A Kubernetes port-forward process (`kubectl` binary).
+    Kubectl,
+}
 
 /// Check whether a process with the given PID is alive.
 ///
@@ -25,18 +35,26 @@ pub fn is_pid_alive(pid: u32) -> bool {
     errno == libc::EPERM
 }
 
-/// Check whether the process with the given PID is an `ssh` process.
+/// Check whether the process with the given PID matches the expected name.
+#[allow(dead_code)]
 ///
-/// On Linux, reads `/proc/<pid>/comm` and checks if it starts with "ssh".
+/// On Linux, reads `/proc/<pid>/comm` and checks against the expected process
+/// name prefix for the given `TunnelProcessType`:
+/// - `Ssh` → checks for `"ssh"` prefix
+/// - `Kubectl` → checks for `"kubectl"` prefix
+///
 /// If `/proc` is unavailable (e.g., macOS or restricted environments), returns
 /// `true` as a conservative fallback — we assume the PID is valid since we
 /// tracked it ourselves.
-pub fn is_ssh_process(pid: u32) -> bool {
+pub fn is_expected_process(pid: u32, process_type: TunnelProcessType) -> bool {
     let comm_path = format!("/proc/{pid}/comm");
     match fs::read_to_string(&comm_path) {
         Ok(content) => {
             let name = content.trim();
-            name == "ssh" || name.starts_with("ssh")
+            match process_type {
+                TunnelProcessType::Ssh => name == "ssh" || name.starts_with("ssh"),
+                TunnelProcessType::Kubectl => name == "kubectl" || name.starts_with("kubectl"),
+            }
         }
         Err(_) => {
             // /proc not available or permission denied — conservative fallback
@@ -45,16 +63,25 @@ pub fn is_ssh_process(pid: u32) -> bool {
     }
 }
 
-/// Check whether the given PID is a live SSH tunnel process.
+/// Check whether the given PID is a live tunnel process of the expected type.
 ///
 /// Combines both liveness and process identity checks. Returns `true` only
-/// if the process is alive AND appears to be an `ssh` process.
+/// if the process is alive AND matches the expected process name.
 #[cfg(unix)]
-pub fn is_live_ssh_tunnel(pid: u32) -> bool {
-    is_pid_alive(pid) && is_ssh_process(pid)
+pub fn is_live_tunnel(pid: u32, process_type: TunnelProcessType) -> bool {
+    is_pid_alive(pid) && is_expected_process(pid, process_type)
 }
 
-#[cfg(test)]
+/// Compatibility alias: check whether the given PID is a live SSH tunnel process.
+///
+/// Equivalent to `is_live_tunnel(pid, TunnelProcessType::Ssh)`.
+#[cfg(unix)]
+#[inline]
+pub fn is_live_ssh_tunnel(pid: u32) -> bool {
+    is_live_tunnel(pid, TunnelProcessType::Ssh)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -91,31 +118,69 @@ mod tests {
         // this should return false. On non-Linux it returns true (fallback).
         if std::path::Path::new("/proc").exists() {
             assert!(
-                !is_ssh_process(pid),
+                !is_expected_process(pid, TunnelProcessType::Ssh),
                 "test runner should not be identified as ssh"
             );
         }
     }
 
     #[test]
-    fn test_is_live_ssh_tunnel_current_process() {
+    fn test_current_process_is_not_kubectl() {
+        let pid = std::process::id();
+        if std::path::Path::new("/proc").exists() {
+            assert!(
+                !is_expected_process(pid, TunnelProcessType::Kubectl),
+                "test runner should not be identified as kubectl"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_live_tunnel_ssh_current_process() {
         let pid = std::process::id();
         // Current process is alive but NOT ssh, so on Linux this should be false.
         if std::path::Path::new("/proc").exists() {
             assert!(
-                !is_live_ssh_tunnel(pid),
+                !is_live_tunnel(pid, TunnelProcessType::Ssh),
                 "test runner should not be a live ssh tunnel"
             );
         }
     }
 
     #[test]
-    fn test_is_live_ssh_tunnel_dead_pid() {
+    fn test_is_live_tunnel_kubectl_current_process() {
+        let pid = std::process::id();
+        if std::path::Path::new("/proc").exists() {
+            assert!(
+                !is_live_tunnel(pid, TunnelProcessType::Kubectl),
+                "test runner should not be a live kubectl tunnel"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_live_tunnel_dead_pid() {
         let pid = 4_000_000;
         if !is_pid_alive(pid) {
             assert!(
-                !is_live_ssh_tunnel(pid),
+                !is_live_tunnel(pid, TunnelProcessType::Ssh),
                 "dead PID should not be a live ssh tunnel"
+            );
+            assert!(
+                !is_live_tunnel(pid, TunnelProcessType::Kubectl),
+                "dead PID should not be a live kubectl tunnel"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_live_ssh_tunnel_compat_alias() {
+        let pid = std::process::id();
+        if std::path::Path::new("/proc").exists() {
+            // Compat alias should behave identically to is_live_tunnel(..., Ssh)
+            assert_eq!(
+                is_live_ssh_tunnel(pid),
+                is_live_tunnel(pid, TunnelProcessType::Ssh)
             );
         }
     }

@@ -1,8 +1,8 @@
 //! UI components and rendering.
 //!
 //! Implements the three-region layout (title bar, list viewport, status bar),
-//! multi-line server entry rows with color-coded state, variable-height
-//! scrolling, and modal input forms for creating/editing entries.
+//! multi-line entry rows with color-coded state, variable-height scrolling,
+//! and modal input forms for creating/editing SSH and K8s tunnel entries.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,7 +10,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{App, AppMode, FormFocus, FormState};
+use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
+use crate::config::TunnelEntry;
 use crate::tunnel::ConnectionState;
 
 // ── Color palette ──────────────────────────────────────────────────────
@@ -25,7 +26,7 @@ const COLOR_TRANSIENT: Color = Color::Yellow;
 const COLOR_DISCONNECTED: Color = Color::DarkGray;
 /// Color for Suspended state.
 const COLOR_SUSPENDED: Color = Color::Magenta;
-/// Color for forward type labels (L, R, D).
+/// Color for forward type labels (L, R, D, K).
 const COLOR_FORWARD_LABEL: Color = Color::Cyan;
 /// Background color for the title bar.
 const COLOR_TITLE_BG: Color = Color::Blue;
@@ -33,14 +34,16 @@ const COLOR_TITLE_BG: Color = Color::Blue;
 const COLOR_STATUS_BG: Color = Color::DarkGray;
 /// Background color for the selected row.
 const COLOR_SELECTED_BG: Color = Color::Rgb(30, 40, 60);
+/// Color for K8s entry type indicator.
+const COLOR_K8S_LABEL: Color = Color::Rgb(100, 180, 255);
 
 // ── Public entry point ─────────────────────────────────────────────────
 
 /// Render the entire application UI.
 ///
 /// This is the top-level `ui()` function called from the main loop.
-/// It dispatches to either the normal list view or the form overlay
-/// based on the current app mode.
+/// It dispatches to either the normal list view, type-select overlay, or
+/// the form overlay based on the current app mode.
 pub fn draw(frame: &mut Frame, app: &App) {
     // Three-region layout: title bar (1), list viewport (fill), status bar (1)
     let chunks = Layout::vertical([
@@ -53,6 +56,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     render_title_bar(frame, chunks[0]);
     render_list_viewport(frame, chunks[1], app);
     render_status_bar(frame, chunks[2], app);
+
+    // If in type-select mode, draw the type selection overlay
+    if let AppMode::TypeSelect(ref sel) = app.mode {
+        render_type_select_overlay(frame, frame.area(), sel);
+    }
 
     // If in form mode, draw the modal overlay on top
     if let AppMode::Form(ref form_state) = app.mode {
@@ -72,7 +80,6 @@ fn render_title_bar(frame: &mut Frame, area: Rect) {
     let title = "tunnel-mgr";
     let hints = "[n]ew  [e]dit  [d]elete  [Enter] connect  [q]uit";
 
-    // Calculate spacing between title and hints
     let available = area.width as usize;
     let title_len = title.len();
     let hints_len = hints.len();
@@ -86,7 +93,6 @@ fn render_title_bar(frame: &mut Frame, area: Rect) {
             Span::styled(hints, style),
         ])
     } else {
-        // Not enough room for hints, just show title
         let padding = available.saturating_sub(title_len);
         let pad_str: String = " ".repeat(padding);
         Line::from(vec![
@@ -114,7 +120,13 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         summary.push_str(&format!("  {suspended} suspended"));
     }
 
-    let line = if let Some(msg) = app.active_status_message() {
+    // Show kubectl warning in status bar if present and no transient message
+    let display_msg = app
+        .active_status_message()
+        .map(|s| s.to_string())
+        .or_else(|| app.kubectl_warning.as_ref().map(|w| format!("⚠ {w}")));
+
+    let line = if let Some(msg) = display_msg {
         let available = area.width as usize;
         let msg_len = msg.len();
         let summary_len = summary.len();
@@ -146,13 +158,18 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
 // ── List viewport ──────────────────────────────────────────────────────
 
-/// Compute the height (in lines) of a server entry row.
-fn row_height(entry: &crate::config::ServerEntry) -> u16 {
-    // Header line + one line per forward (minimum 1 total)
-    1 + entry.forwards.len().max(0) as u16
+/// Compute the height (in lines) of a tunnel entry row.
+fn entry_row_height(entry: &TunnelEntry) -> u16 {
+    match entry {
+        // Header line + one line per SSH forward (minimum 1 total)
+        TunnelEntry::Ssh(e) => 1 + e.forwards.len() as u16,
+        // Header line + one line per K8s port-forward binding (minimum 1 total)
+        TunnelEntry::K8s(e) => 1 + e.forwards.len() as u16,
+    }
+    .max(1)
 }
 
-/// Render the scrollable list of server entries.
+/// Render the scrollable list of tunnel entries.
 fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
     if app.entries.is_empty() {
         let empty_msg = Paragraph::new(Line::from(vec![Span::styled(
@@ -164,15 +181,15 @@ fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let viewport_height = area.height as usize;
+    let heights: Vec<usize> = app
+        .entries
+        .iter()
+        .map(|e| entry_row_height(e) as usize)
+        .collect();
 
-    // Compute cumulative heights and adjust scroll offset
-    let heights: Vec<usize> = app.entries.iter().map(|e| row_height(e) as usize).collect();
-
-    // Adjust scroll offset to keep selected row fully visible
     let scroll_offset =
         compute_scroll_offset(app.selected, app.scroll_offset, &heights, viewport_height);
 
-    // Render visible rows
     let mut y_offset: u16 = 0;
     let mut cumulative = 0usize;
 
@@ -189,7 +206,7 @@ fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
         }
 
         let is_selected = i == app.selected;
-        let state = app.state_of(&entry.id);
+        let state = app.state_of(&entry.id());
 
         let row_area = Rect {
             x: area.x,
@@ -198,7 +215,10 @@ fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
             height: (h as u16).min(area.height - y_offset),
         };
 
-        render_entry_row(frame, row_area, entry, state, is_selected);
+        match entry {
+            TunnelEntry::Ssh(ssh) => render_ssh_entry_row(frame, row_area, ssh, state, is_selected),
+            TunnelEntry::K8s(k8s) => render_k8s_entry_row(frame, row_area, k8s, state, is_selected),
+        }
 
         y_offset += h as u16;
         cumulative += h;
@@ -216,18 +236,15 @@ fn compute_scroll_offset(
         return 0;
     }
 
-    // Compute the top (cumulative lines before selected) and bottom of selected row
     let top_of_selected: usize = heights[..selected].iter().sum();
     let bottom_of_selected = top_of_selected + heights[selected];
 
     let mut offset = current_offset;
 
-    // If selected row starts above the viewport, scroll up
     if top_of_selected < offset {
         offset = top_of_selected;
     }
 
-    // If selected row ends below the viewport, scroll down
     if bottom_of_selected > offset + viewport_height {
         offset = bottom_of_selected.saturating_sub(viewport_height);
     }
@@ -235,8 +252,8 @@ fn compute_scroll_offset(
     offset
 }
 
-/// Render a single server entry row.
-fn render_entry_row(
+/// Render a single SSH server entry row.
+fn render_ssh_entry_row(
     frame: &mut Frame,
     area: Rect,
     entry: &crate::config::ServerEntry,
@@ -249,20 +266,14 @@ fn render_entry_row(
         Color::Reset
     };
 
-    let state_color = match state {
-        ConnectionState::Connected => COLOR_CONNECTED,
-        ConnectionState::Failed => COLOR_FAILED,
-        ConnectionState::Connecting | ConnectionState::Reconnecting => COLOR_TRANSIENT,
-        ConnectionState::Disconnected => COLOR_DISCONNECTED,
-        ConnectionState::Suspended => COLOR_SUSPENDED,
-    };
-
+    let state_color = state_to_color(state);
     let state_indicator = format!("[{}]", state.label());
 
-    // Build header line: name  [state]  host:port  user  identity
     let mut header_spans = vec![
+        Span::styled("  ", Style::default().bg(bg)),
+        Span::styled("[SSH] ", Style::default().fg(Color::DarkGray).bg(bg)),
         Span::styled(
-            format!("  {} ", entry.name),
+            format!("{} ", entry.name),
             Style::default()
                 .fg(Color::White)
                 .bg(bg)
@@ -292,7 +303,6 @@ fn render_entry_row(
         ));
     }
 
-    // Pad the rest of the line with background color
     header_spans.push(Span::styled(
         " ".repeat(area.width as usize),
         Style::default().bg(bg),
@@ -300,7 +310,6 @@ fn render_entry_row(
 
     let mut lines: Vec<Line> = vec![Line::from(header_spans)];
 
-    // Forward lines
     for fwd in &entry.forwards {
         let type_label = fwd.type_label();
         let addr = fwd.display_address();
@@ -316,28 +325,161 @@ fn render_entry_row(
         lines.push(fwd_line);
     }
 
-    let paragraph = Paragraph::new(lines);
-    frame.render_widget(paragraph, area);
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Render a single K8s entry row.
+fn render_k8s_entry_row(
+    frame: &mut Frame,
+    area: Rect,
+    entry: &crate::config::K8sEntry,
+    state: ConnectionState,
+    is_selected: bool,
+) {
+    let bg = if is_selected {
+        COLOR_SELECTED_BG
+    } else {
+        Color::Reset
+    };
+
+    let state_color = state_to_color(state);
+    let state_indicator = format!("[{}]", state.label());
+
+    let mut header_spans = vec![
+        Span::styled("  ", Style::default().bg(bg)),
+        Span::styled("[K8s] ", Style::default().fg(COLOR_K8S_LABEL).bg(bg)),
+        Span::styled(
+            format!("{} ", entry.name),
+            Style::default()
+                .fg(Color::White)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{state_indicator} "),
+            Style::default().fg(state_color).bg(bg),
+        ),
+        Span::styled(
+            entry.resource_identifier(),
+            Style::default().fg(COLOR_K8S_LABEL).bg(bg),
+        ),
+    ];
+
+    if let Some(ref ctx) = entry.context {
+        header_spans.push(Span::styled(
+            format!("  ctx:{ctx}"),
+            Style::default().fg(Color::DarkGray).bg(bg),
+        ));
+    }
+    if let Some(ref ns) = entry.namespace {
+        header_spans.push(Span::styled(
+            format!("  ns:{ns}"),
+            Style::default().fg(Color::DarkGray).bg(bg),
+        ));
+    }
+
+    header_spans.push(Span::styled(
+        " ".repeat(area.width as usize),
+        Style::default().bg(bg),
+    ));
+
+    let mut lines: Vec<Line> = vec![Line::from(header_spans)];
+
+    for fwd in &entry.forwards {
+        let addr = fwd.display_address();
+        let fwd_line = Line::from(vec![
+            Span::styled("    [K] ", Style::default().fg(COLOR_FORWARD_LABEL).bg(bg)),
+            Span::styled(addr, Style::default().fg(Color::White).bg(bg)),
+            Span::styled(" ".repeat(area.width as usize), Style::default().bg(bg)),
+        ]);
+        lines.push(fwd_line);
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Map a `ConnectionState` to a display color.
+fn state_to_color(state: ConnectionState) -> Color {
+    match state {
+        ConnectionState::Connected => COLOR_CONNECTED,
+        ConnectionState::Failed => COLOR_FAILED,
+        ConnectionState::Connecting | ConnectionState::Reconnecting => COLOR_TRANSIENT,
+        ConnectionState::Disconnected => COLOR_DISCONNECTED,
+        ConnectionState::Suspended => COLOR_SUSPENDED,
+    }
+}
+
+// ── Type selection overlay ─────────────────────────────────────────────
+
+/// Render the entry type selection overlay (SSH / K8s choice).
+fn render_type_select_overlay(frame: &mut Frame, area: Rect, sel: &EntryTypeSelection) {
+    let width = 36u16.min(area.width.saturating_sub(4));
+    let height = 7u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+
+    let overlay_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, overlay_area);
+
+    let block = Block::default()
+        .title(" New Entry — Select Type ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+
+    let inner = block.inner(overlay_area);
+    frame.render_widget(block, overlay_area);
+
+    let options = ["SSH Server", "Kubernetes Workload"];
+    let mut lines: Vec<Line> = vec![Line::from("")];
+    for (i, opt) in options.iter().enumerate() {
+        let is_selected = i == sel.selected;
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let prefix = if is_selected { " > " } else { "   " };
+        lines.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Tab/↑↓: select  Enter: confirm  Esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    )]));
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 // ── Form overlay ───────────────────────────────────────────────────────
 
-/// Render the modal form overlay for creating/editing a server entry.
+/// Render the modal form overlay for creating/editing an entry.
 fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
     let is_edit = form.editing_id.is_some();
-    let title = if is_edit {
-        " Edit Server Entry "
-    } else {
-        " New Server Entry "
+    let title = match (&form.entry_type, is_edit) {
+        (FormEntryType::Ssh, false) => " New SSH Entry ",
+        (FormEntryType::Ssh, true) => " Edit SSH Entry ",
+        (FormEntryType::K8s, false) => " New K8s Entry ",
+        (FormEntryType::K8s, true) => " Edit K8s Entry ",
     };
 
     let is_editing_forward = matches!(form.focus, FormFocus::ForwardEdit { .. });
 
-    // Compute form dimensions
     let form_width = 60u16.min(area.width.saturating_sub(4));
-    let base_height = form.fields.len() as u16 + 4; // fields + title + borders + forward header
-    let forward_lines = form.forwards.len() as u16;
-    let editing_fwd_lines = if is_editing_forward { 5 } else { 0 };
+    let base_height = form.fields.len() as u16 + 4;
+    let forward_lines = match form.entry_type {
+        FormEntryType::Ssh => form.forwards.len() as u16,
+        FormEntryType::K8s => form.k8s_forwards.len() as u16,
+    };
+    let editing_fwd_lines = if is_editing_forward { 4 } else { 0 };
     let form_height =
         (base_height + forward_lines + editing_fwd_lines + 3).min(area.height.saturating_sub(2));
 
@@ -351,7 +493,6 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         height: form_height,
     };
 
-    // Clear the area behind the form
     frame.render_widget(Clear, form_area);
 
     let block = Block::default()
@@ -365,7 +506,7 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Render server fields
+    // Render server/entry fields
     let server_fields_focused = matches!(form.focus, FormFocus::ServerFields);
     for (i, field) in form.fields.iter().enumerate() {
         let is_focused = server_fields_focused && i == form.focused_field;
@@ -378,9 +519,9 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         };
 
         let is_toggle = field.label == "Auto Restart";
+        let is_cycle = field.label == "Resource Type";
 
         if is_toggle {
-            // Render as a toggle: [yes] / [no] with highlight
             let yes_style = if field.value == "yes" {
                 Style::default()
                     .fg(Color::Green)
@@ -405,15 +546,25 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                 Span::styled("no", no_style),
                 Span::styled(hint, Style::default().fg(Color::DarkGray)),
             ]));
+        } else if is_cycle {
+            let hint = if is_focused { "  (type to change)" } else { "" };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{:>14}: ", field.label), label_style),
+                Span::styled(
+                    &field.value,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(hint, Style::default().fg(Color::DarkGray)),
+            ]));
         } else {
             let value_style = if is_focused {
                 Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 60))
             } else {
                 Style::default().fg(Color::White)
             };
-
             let cursor = if is_focused { "_" } else { "" };
-
             lines.push(Line::from(vec![
                 Span::styled(format!("{:>14}: ", field.label), label_style),
                 Span::styled(format!("{}{}", field.value, cursor), value_style),
@@ -424,15 +575,19 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
     // Blank line before forwards section
     lines.push(Line::from(""));
 
-    // Forwards header with context-sensitive hints
+    // Forwards header
     let hints = match form.focus {
         FormFocus::ForwardList => "(Enter edit  Ctrl+A add  Ctrl+D del)",
-        FormFocus::ForwardEdit { .. } => "(Enter save  Esc cancel  Ctrl+T type)",
+        FormFocus::ForwardEdit { .. } => "(Enter save  Esc cancel)",
         FormFocus::ServerFields => "(Ctrl+A add  Tab to list)",
+    };
+    let fwd_section_label = match form.entry_type {
+        FormEntryType::Ssh => "  Forwards ",
+        FormEntryType::K8s => "  Port Bindings ",
     };
     lines.push(Line::from(vec![
         Span::styled(
-            "  Forwards ",
+            fwd_section_label,
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -440,40 +595,49 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         Span::styled(hints, Style::default().fg(Color::DarkGray)),
     ]));
 
-    // Existing forwards (with selection highlight in ForwardList mode)
+    // Existing forwards
     let in_forward_list = matches!(form.focus, FormFocus::ForwardList);
-    for (i, fwd) in form.forwards.iter().enumerate() {
-        let type_label = fwd.type_label();
-        let addr = fwd.display_address();
-        let is_selected = in_forward_list && i == form.selected_forward;
-
-        let (type_style, addr_style) = if is_selected {
-            (
-                Style::default()
-                    .fg(COLOR_FORWARD_LABEL)
-                    .bg(Color::Rgb(40, 40, 60))
-                    .add_modifier(Modifier::BOLD),
-                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 60)),
-            )
-        } else {
-            (
-                Style::default().fg(COLOR_FORWARD_LABEL),
-                Style::default().fg(Color::White),
-            )
-        };
-
-        let prefix = if is_selected { "  > " } else { "    " };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{prefix}[{type_label}] "), type_style),
-            Span::styled(addr, addr_style),
-        ]));
-    }
-
-    if form.forwards.is_empty() && !is_editing_forward {
-        lines.push(Line::from(vec![Span::styled(
-            "    (none — Ctrl+A to add)",
-            Style::default().fg(Color::DarkGray),
-        )]));
+    match form.entry_type {
+        FormEntryType::Ssh => {
+            for (i, fwd) in form.forwards.iter().enumerate() {
+                let type_label = fwd.type_label();
+                let addr = fwd.display_address();
+                let is_sel = in_forward_list && i == form.selected_forward;
+                let (type_style, addr_style) = forward_styles(is_sel);
+                let prefix = if is_sel { "  > " } else { "    " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{prefix}[{type_label}] "), type_style),
+                    Span::styled(addr, addr_style),
+                ]));
+            }
+            if form.forwards.is_empty() && !is_editing_forward {
+                lines.push(Line::from(vec![Span::styled(
+                    "    (none — Ctrl+A to add)",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
+        FormEntryType::K8s => {
+            for (i, fwd) in form.k8s_forwards.iter().enumerate() {
+                let addr = fwd.display_address();
+                let is_sel = in_forward_list && i == form.selected_forward;
+                let (_type_style, addr_style) = forward_styles(is_sel);
+                let prefix = if is_sel { "  > " } else { "    " };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{prefix}[K] "),
+                        Style::default().fg(COLOR_K8S_LABEL),
+                    ),
+                    Span::styled(addr, addr_style),
+                ]));
+            }
+            if form.k8s_forwards.is_empty() && !is_editing_forward {
+                lines.push(Line::from(vec![Span::styled(
+                    "    (none — Ctrl+A to add)",
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
+        }
     }
 
     // Forward sub-form (if editing)
@@ -481,23 +645,41 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         let editing_label = match form.focus {
             FormFocus::ForwardEdit {
                 editing_index: Some(_),
-            } => "Editing forward",
-            _ => "New forward",
+            } => "Editing binding",
+            _ => "New binding",
         };
-        let type_name = match form.forward_type {
-            0 => "Local (-L)",
-            1 => "Remote (-R)",
-            2 => "Dynamic (-D)",
-            _ => "Unknown",
+
+        let type_desc = match form.entry_type {
+            FormEntryType::Ssh => {
+                let type_name = match form.forward_type {
+                    0 => "Local (-L)",
+                    1 => "Remote (-R)",
+                    2 => "Dynamic (-D)",
+                    _ => "Unknown",
+                };
+                format!("{editing_label} — Type: {type_name}  (Ctrl+T to cycle)")
+            }
+            FormEntryType::K8s => format!("{editing_label} — kubectl port-forward"),
         };
+
         lines.push(Line::from(vec![Span::styled(
-            format!("    {editing_label} — Type: {type_name}  (Ctrl+T to cycle)"),
+            format!("    {type_desc}"),
             Style::default().fg(COLOR_TRANSIENT),
         )]));
 
-        let num_fields = if form.forward_type == 2 { 1 } else { 3 };
+        let num_fields = match form.entry_type {
+            FormEntryType::Ssh => {
+                if form.forward_type == 2 {
+                    1
+                } else {
+                    3
+                }
+            }
+            FormEntryType::K8s => 2,
+        };
+
         for (fi, field) in form.forward_fields.iter().enumerate().take(num_fields) {
-            let is_focused = is_editing_forward && fi == form.forward_field;
+            let is_focused = fi == form.forward_field;
             let label_style = if is_focused {
                 Style::default()
                     .fg(Color::Cyan)
@@ -511,7 +693,6 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                 Style::default().fg(Color::White)
             };
             let cursor = if is_focused { "_" } else { "" };
-
             lines.push(Line::from(vec![
                 Span::styled(format!("    {:>14}: ", field.label), label_style),
                 Span::styled(format!("{}{}", field.value, cursor), value_style),
@@ -522,12 +703,8 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
     // Blank line + hints
     lines.push(Line::from(""));
     let bottom_hints = match form.focus {
-        FormFocus::ForwardEdit { .. } => {
-            "  Enter: save forward  Esc: cancel  Tab/Shift+Tab: fields"
-        }
-        FormFocus::ForwardList => {
-            "  Enter: edit forward  Esc: cancel form  Tab/Shift+Tab: navigate"
-        }
+        FormFocus::ForwardEdit { .. } => "  Enter: save  Esc: cancel  Tab/Shift+Tab: fields",
+        FormFocus::ForwardList => "  Enter: edit  Esc: cancel form  Tab/Shift+Tab: navigate",
         FormFocus::ServerFields => "  Enter: save entry  Esc: cancel  Tab/Shift+Tab: fields",
     };
     lines.push(Line::from(vec![Span::styled(
@@ -537,4 +714,22 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
 
     let form_content = Paragraph::new(lines).wrap(Wrap { trim: false });
     frame.render_widget(form_content, inner);
+}
+
+/// Returns (type_style, addr_style) for a forward list row, selected or not.
+fn forward_styles(is_selected: bool) -> (Style, Style) {
+    if is_selected {
+        (
+            Style::default()
+                .fg(COLOR_FORWARD_LABEL)
+                .bg(Color::Rgb(40, 40, 60))
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 60)),
+        )
+    } else {
+        (
+            Style::default().fg(COLOR_FORWARD_LABEL),
+            Style::default().fg(Color::White),
+        )
+    }
 }

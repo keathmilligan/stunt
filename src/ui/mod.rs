@@ -4,7 +4,7 @@
 //! multi-line entry rows with color-coded state, variable-height scrolling,
 //! and modal input forms for creating/editing SSH and K8s tunnel entries.
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -172,11 +172,61 @@ fn entry_row_height(entry: &TunnelEntry) -> u16 {
 /// Render the scrollable list of tunnel entries.
 fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
     if app.entries.is_empty() {
-        let empty_msg = Paragraph::new(Line::from(vec![Span::styled(
-            "  No tunnel entries. Press 'n' to create one.",
-            Style::default().fg(Color::DarkGray),
-        )]));
-        frame.render_widget(empty_msg, area);
+        // ASCII logo (5 lines) + blank separator + tagline + blank + hint = 9 lines total
+        let logo_lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                r"  ____  _____            _____  ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                r" / ___||_   _|_   _ _ __|_   _| ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                r" \___ \  | | | | | | '_ \| |   ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                r"  ___) | | | | |_| | | | | |   ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                r" |____/  |_|  \__,_|_| |_|_|   ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Stupid Tunnel Tricks",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press 'n' to create a tunnel entry.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let content_height = logo_lines.len() as u16;
+        let vertical_pad = area.height.saturating_sub(content_height) / 2;
+        let logo_area = Layout::vertical([
+            Constraint::Length(vertical_pad),
+            Constraint::Length(content_height),
+            Constraint::Min(0),
+        ])
+        .split(area)[1];
+        let logo = Paragraph::new(logo_lines).alignment(Alignment::Center);
+        frame.render_widget(logo, logo_area);
         return;
     }
 

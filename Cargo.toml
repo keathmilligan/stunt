@@ -2,7 +2,15 @@
 name = "stunt"
 version = "0.1.0"
 edition = "2024"
-description = "STunT — Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections"
+description = "STunT - Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections"
+license = "MIT"
+repository = "https://github.com/keathmilligan/stunt"
+keywords = ["cli", "ssh", "tunnel", "tui", "network"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "stunt"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -18,3 +26,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = true
+strip = true

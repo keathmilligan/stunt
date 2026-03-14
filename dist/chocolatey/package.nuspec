@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>stunt</id>
+    <version>0.1.0</version>
+    <title>stunt</title>
+    <authors>Keath Milligan</authors>
+    <projectUrl>https://github.com/keathmilligan/stunt</projectUrl>
+    <licenseUrl>https://github.com/keathmilligan/stunt/blob/master/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>STunT - Stupid Tunnel Tricks: A terminal user interface for defining, configuring, and managing SSH tunnel connections.</description>
+    <tags>cli ssh tunnel tui terminal network development-tools</tags>
+    <packageSourceUrl>https://github.com/keathmilligan/stunt</packageSourceUrl>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

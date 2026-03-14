@@ -1,0 +1,11 @@
+name: "stunt"
+arch: "{{ARCH}}"
+platform: "linux"
+version: "{{VERSION}}"
+maintainer: "${MAINTAINER}"
+description: "STunT - Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections"
+homepage: "https://github.com/keathmilligan/stunt"
+license: "MIT"
+contents:
+  - src: ./stunt
+    dst: /usr/bin/stunt

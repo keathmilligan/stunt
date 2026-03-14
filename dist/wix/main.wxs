@@ -1,0 +1,105 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX3 installer source for stunt.
+  Built by: cargo wix --no-build --install-version <VERSION> -o stunt-<VERSION>-x86_64.msi
+  Requires: cargo-wix, WiX Toolset v3
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+  <Product
+    Id='*'
+    Name='stunt'
+    UpgradeCode='C4B3D2E5-8F9A-4B1C-D3A6-7E4F9C2B5D8E'
+    Manufacturer='Keath Milligan'
+    Language='1033'
+    Codepage='1252'
+    Version='$(var.Version)'>
+
+    <Package Id='*'
+      Keywords='Installer'
+      Description='STunT - Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections'
+      Manufacturer='Keath Milligan'
+      InstallerVersion='450'
+      Languages='1033'
+      Compressed='yes'
+      SummaryCodepage='1252'/>
+
+    <MajorUpgrade
+      Schedule='afterInstallInitialize'
+      DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+    <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+    <Property Id='DiskPrompt' Value='stunt Installation'/>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Directory structure
+    ════════════════════════════════════════════════════════════════ -->
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='ProgramFiles64Folder'>
+        <Directory Id='APPLICATIONROOTDIRECTORY' Name='stunt'/>
+      </Directory>
+    </Directory>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Components
+    ════════════════════════════════════════════════════════════════ -->
+    <DirectoryRef Id='APPLICATIONROOTDIRECTORY'>
+      <Component Id='binary0' Guid='B2C3D4E5-F6A7-8901-BCDE-2345678901AB'>
+        <File
+          Id='exe0'
+          Name='stunt.exe'
+          DiskId='1'
+          Source='$(var.CargoTargetBinDir)\stunt.exe'
+          KeyPath='yes'/>
+      </Component>
+
+      <!-- Add install directory to system PATH -->
+      <Component Id='PathComponent' Guid='E8D7C6B5-A4F3-2109-EDCB-A9876543210F'>
+        <Environment
+          Id='PATH'
+          Name='PATH'
+          Value='[APPLICATIONROOTDIRECTORY]'
+          Permanent='no'
+          Part='last'
+          Action='set'
+          System='yes'/>
+        <RegistryValue
+          Root='HKCU'
+          Key='Software\stunt'
+          Name='installed'
+          Type='integer'
+          Value='1'
+          KeyPath='yes'/>
+      </Component>
+    </DirectoryRef>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Feature
+    ════════════════════════════════════════════════════════════════ -->
+    <Feature
+      Id='MainProgram'
+      Title='stunt'
+      Description='Installs stunt CLI.'
+      Display='expand'
+      Level='1'
+      ConfigurableDirectory='APPLICATIONROOTDIRECTORY'>
+      <ComponentRef Id='binary0'/>
+      <ComponentRef Id='PathComponent'/>
+    </Feature>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         UI
+    ════════════════════════════════════════════════════════════════ -->
+    <UIRef Id='WixUI_FeatureTree'/>
+    <UIRef Id='WixUI_ErrorProgressText'/>
+    <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Add/Remove Programs metadata
+    ════════════════════════════════════════════════════════════════ -->
+    <Property Id='ARPHELPLINK' Value='https://github.com/keathmilligan/stunt'/>
+    <Property Id='ARPURLINFOABOUT' Value='https://github.com/keathmilligan/stunt'/>
+    <Property Id='ARPURLUPDATEINFO' Value='https://github.com/keathmilligan/stunt/releases'/>
+    <Property Id='ARPNOREPAIR' Value='1' Secure='yes'/>
+
+  </Product>
+</Wix>

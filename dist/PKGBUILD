@@ -1,0 +1,20 @@
+# Maintainer: ${MAINTAINER_NAME} <${MAINTAINER_EMAIL}>
+pkgname=stunt-bin
+pkgver=${VERSION}
+pkgrel=1
+pkgdesc='STunT - Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections'
+arch=('x86_64' 'aarch64')
+url='https://github.com/keathmilligan/stunt'
+license=('MIT')
+provides=('stunt')
+conflicts=('stunt')
+
+source_x86_64=("https://github.com/keathmilligan/stunt/releases/download/v${pkgver}/stunt-${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("https://github.com/keathmilligan/stunt/releases/download/v${pkgver}/stunt-${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  install -Dm755 "stunt" "${pkgdir}/usr/bin/stunt"
+}

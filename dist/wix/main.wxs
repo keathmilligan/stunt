@@ -1,7 +1,6 @@
 <?xml version='1.0' encoding='windows-1252'?>
 <!--
   WiX3 installer source for stunt.
-  Built by: cargo wix --no-build --install-version <VERSION> -o stunt-<VERSION>-x86_64.msi
   Requires: cargo-wix, WiX Toolset v3
 -->
 <Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>

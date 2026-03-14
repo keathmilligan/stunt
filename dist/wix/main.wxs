@@ -90,7 +90,7 @@
     ════════════════════════════════════════════════════════════════ -->
     <UIRef Id='WixUI_FeatureTree'/>
     <UIRef Id='WixUI_ErrorProgressText'/>
-    <WixVariable Id='WixUILicenseRtf' Value='wix\License.rtf'/>
+    <WixVariable Id='WixUILicenseRtf' Value='dist\wix\License.rtf'/>
 
     <!-- ═══════════════════════════════════════════════════════════════
          Add/Remove Programs metadata

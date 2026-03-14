@@ -2,18 +2,16 @@ $ErrorActionPreference = 'Stop'
 
 $version  = '__VERSION__'
 $repo     = 'keathmilligan/stunt'
-$msiName  = "stunt-${version}-x86_64.msi"
-$url      = "https://github.com/${repo}/releases/download/v${version}/${msiName}"
-$checksum = '__SHA256_MSI__'
+$zipName  = "stunt-${version}-x86_64-pc-windows-msvc.zip"
+$url      = "https://github.com/${repo}/releases/download/v${version}/${zipName}"
+$checksum = '__SHA256_ZIP__'
 
 $packageArgs = @{
   packageName    = 'stunt'
-  fileType       = 'MSI'
+  unzipLocation  = $(Split-Path -Parent $MyInvocation.MyCommand.Definition)
   url64bit       = $url
   checksum64     = $checksum
   checksumType64 = 'sha256'
-  silentArgs     = '/qn /norestart'
-  validExitCodes = @(0, 3010)
 }
 
-Install-ChocolateyPackage @packageArgs
+Install-ChocolateyZipPackage @packageArgs

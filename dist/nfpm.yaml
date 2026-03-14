@@ -7,5 +7,5 @@ description: "STunT - Stupid Tunnel Tricks: A TUI for managing SSH tunnel connec
 homepage: "https://github.com/keathmilligan/stunt"
 license: "MIT"
 contents:
-  - src: ./stunt
+  - src: ./packaging/stunt
     dst: /usr/bin/stunt

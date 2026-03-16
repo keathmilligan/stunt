@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+jobs:
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Test
+        run: cargo test
+
+      - name: Build (release)
+        run: cargo build --release
+
+  publish-badges:
+    name: Refresh README Badges
+    needs: ci
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    uses: keathmilligan/release-infra/.github/workflows/publish-badges.yml@master
+    with:
+      project-name: stunt
+      packages-repo: keathmilligan/packages
+      enable-cargo: true
+      enable-install-scripts: true
+      enable-homebrew: true
+      enable-scoop: true
+      enable-apt: true
+      enable-rpm: true
+      enable-dmg: true
+      enable-msi: true
+      enable-chocolatey: false
+      enable-winget: false
+      enable-apk: false
+      enable-aur: false
+    secrets: inherit

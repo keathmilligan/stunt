@@ -33,11 +33,13 @@ jobs:
       enable-install-scripts: true
       enable-homebrew: true
       enable-scoop: true
-      enable-chocolatey: true
-      enable-winget: true
+      enable-chocolatey: false
+      enable-winget: false
       enable-apt: true
       enable-rpm: true
       enable-apk: false
       enable-dmg: true
-      enable-aur: true
+      enable-msi: true
+      enable-aur: false
+      enable-badges: true
     secrets: inherit

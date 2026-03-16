@@ -116,15 +116,6 @@ pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<u32> {
     Ok(pid)
 }
 
-/// Spawn the SSH command for the given `ServerEntry` as a detached process.
-///
-/// Delegates to `spawn_detached_cmd(build_ssh_command(entry))`.
-#[cfg(unix)]
-pub fn spawn_detached(entry: &ServerEntry) -> anyhow::Result<u32> {
-    spawn_detached_cmd(build_ssh_command(entry))
-        .map_err(|e| anyhow::anyhow!("failed to spawn ssh: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

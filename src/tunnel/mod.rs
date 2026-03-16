@@ -5,12 +5,10 @@ pub mod pid;
 mod state;
 mod supervisor;
 
-#[cfg(unix)]
-pub use command::spawn_detached_cmd;
 pub use command::{build_kubectl_command, build_ssh_command};
 pub use pid::TunnelProcessType;
 #[cfg(unix)]
-pub use pid::{is_live_ssh_tunnel, is_live_tunnel};
+pub use pid::is_live_tunnel;
 pub use state::{ConnectionState, TunnelEvent};
 pub use supervisor::Supervisor;
 

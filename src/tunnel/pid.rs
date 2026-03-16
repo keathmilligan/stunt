@@ -72,15 +72,6 @@ pub fn is_live_tunnel(pid: u32, process_type: TunnelProcessType) -> bool {
     is_pid_alive(pid) && is_expected_process(pid, process_type)
 }
 
-/// Compatibility alias: check whether the given PID is a live SSH tunnel process.
-///
-/// Equivalent to `is_live_tunnel(pid, TunnelProcessType::Ssh)`.
-#[cfg(unix)]
-#[inline]
-pub fn is_live_ssh_tunnel(pid: u32) -> bool {
-    is_live_tunnel(pid, TunnelProcessType::Ssh)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -169,18 +160,6 @@ mod tests {
             assert!(
                 !is_live_tunnel(pid, TunnelProcessType::Kubectl),
                 "dead PID should not be a live kubectl tunnel"
-            );
-        }
-    }
-
-    #[test]
-    fn test_is_live_ssh_tunnel_compat_alias() {
-        let pid = std::process::id();
-        if std::path::Path::new("/proc").exists() {
-            // Compat alias should behave identically to is_live_tunnel(..., Ssh)
-            assert_eq!(
-                is_live_ssh_tunnel(pid),
-                is_live_tunnel(pid, TunnelProcessType::Ssh)
             );
         }
     }

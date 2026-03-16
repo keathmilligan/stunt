@@ -29,7 +29,7 @@ jobs:
       tap-repo: keathmilligan/homebrew-tap
       bucket-repo: keathmilligan/scoop-bucket
       packages-repo: keathmilligan/packages
-      enable-cargo: true
+      enable-cargo: false
       enable-install-scripts: true
       enable-homebrew: true
       enable-scoop: true

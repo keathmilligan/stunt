@@ -4,11 +4,11 @@
 //! multi-line entry rows with color-coded state, variable-height scrolling,
 //! and modal input forms for creating/editing SSH and K8s tunnel entries.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
 use crate::config::TunnelEntry;

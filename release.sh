@@ -16,7 +16,7 @@ Usage: $(basename "$0") <new-version>
 
 The script:
   1. Validates the new version is a valid semver increment of the
-     currently published crates.io version.
+      current version in Cargo.toml.
   2. Updates Cargo.toml (and Cargo.lock via 'cargo update -p stunt').
   3. Updates the version badge / mention in README.md if present.
   4. Commits and pushes the version bump to master.
@@ -84,30 +84,25 @@ README="$REPO_DIR/README.md"
 [[ -f "$CARGO_TOML" ]] || die "Cargo.toml not found at $CARGO_TOML"
 
 # ---------------------------------------------------------------------------
-# Fetch the currently published version from crates.io.
+# Get the current version from Cargo.toml.
 # ---------------------------------------------------------------------------
 
-echo "Fetching published version from crates.io..."
-PUBLISHED_VERSION=$(cargo search stunt 2>/dev/null \
-    | grep -E '^stunt ' \
-    | grep -oP '"\K[0-9]+\.[0-9]+\.[0-9]+(?=")' \
-    | head -1)
+CURRENT_VERSION=$(grep -m1 '^version = ' "$CARGO_TOML" | grep -oP '"\K[^"]+(?=")')
+[[ -n "$CURRENT_VERSION" ]] \
+    || die "Could not determine the current version from Cargo.toml."
 
-[[ -n "$PUBLISHED_VERSION" ]] \
-    || die "Could not determine the published version from crates.io."
-
-echo "  Published : $PUBLISHED_VERSION"
+echo "  Current   : $CURRENT_VERSION"
 echo "  New       : $NEW_VERSION"
 
 # ---------------------------------------------------------------------------
 # Validate the increment.
 # ---------------------------------------------------------------------------
 
-if ! is_valid_increment "$PUBLISHED_VERSION" "$NEW_VERSION"; then
-    die "'$NEW_VERSION' is not a valid semver increment of '$PUBLISHED_VERSION'. " \
-        "Allowed: $((${PUBLISHED_VERSION%%.*} + 1)).0.0, " \
-        "$(echo "$PUBLISHED_VERSION" | cut -d. -f1).$(($(echo "$PUBLISHED_VERSION" | cut -d. -f2) + 1)).0, " \
-        "or $PUBLISHED_VERSION with the patch incremented by 1."
+if ! is_valid_increment "$CURRENT_VERSION" "$NEW_VERSION"; then
+    die "'$NEW_VERSION' is not a valid semver increment of '$CURRENT_VERSION'. " \
+        "Allowed: $((${CURRENT_VERSION%%.*} + 1)).0.0, " \
+        "$(echo "$CURRENT_VERSION" | cut -d. -f1).$(($(echo "$CURRENT_VERSION" | cut -d. -f2) + 1)).0, " \
+        "or $CURRENT_VERSION with the patch incremented by 1."
 fi
 
 echo "Version increment is valid."

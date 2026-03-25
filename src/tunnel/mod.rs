@@ -5,7 +5,7 @@ pub mod pid;
 mod state;
 mod supervisor;
 
-pub use command::{build_kubectl_command, build_ssh_command};
+pub use command::{build_kubectl_command, build_ssh_command, build_sshuttle_command};
 pub use pid::TunnelProcessType;
 #[cfg(unix)]
 pub use pid::is_live_tunnel;
@@ -38,6 +38,19 @@ pub fn check_kubectl_available() -> bool {
     std::process::Command::new("kubectl")
         .arg("version")
         .arg("--client")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+/// Check that the `sshuttle` binary is available on PATH.
+///
+/// Returns `true` if found, `false` if not. Absence is a non-fatal warning —
+/// SSH and K8s tunnels remain functional; only sshuttle entries will fail to connect.
+pub fn check_sshuttle_available() -> bool {
+    std::process::Command::new("sshuttle")
+        .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()

@@ -4,7 +4,7 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use crate::config::{K8sEntry, K8sPortForward, ServerEntry};
+use crate::config::{K8sEntry, K8sPortForward, ServerEntry, SshuttleEntry};
 
 /// Build a `tokio::process::Command` from a `ServerEntry`.
 ///
@@ -82,6 +82,46 @@ pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Comm
     cmd
 }
 
+/// Build a `tokio::process::Command` for an `SshuttleEntry`.
+///
+/// The command form is:
+/// ```text
+/// sshuttle -r [user@]host[:port] [-e 'ssh -i <identity_file>'] <subnet>...
+/// ```
+pub fn build_sshuttle_command(entry: &SshuttleEntry) -> Command {
+    let mut cmd = Command::new("sshuttle");
+
+    // Assemble the remote argument: [user@]host[:port]
+    let remote = {
+        let host_part = match &entry.user {
+            Some(user) => format!("{user}@{}", entry.host),
+            None => entry.host.clone(),
+        };
+        match entry.port {
+            Some(port) => format!("{host_part}:{port}"),
+            None => host_part,
+        }
+    };
+    cmd.arg("-r").arg(remote);
+
+    // Optional identity file passed via -e 'ssh -i <path>'
+    if let Some(ref identity_file) = entry.identity_file {
+        cmd.arg("-e").arg(format!("ssh -i {identity_file}"));
+    }
+
+    // Positional subnet arguments
+    for subnet in &entry.subnets {
+        cmd.arg(subnet);
+    }
+
+    // Capture all stdio so sshuttle doesn't interfere with the TUI
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    cmd
+}
+
 /// Spawn the given command detached in a new session.
 ///
 /// Calls `setsid()` via `pre_exec` so the process survives the TUI
@@ -119,7 +159,9 @@ pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, TunnelForward};
+    use crate::config::{
+        K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry, TunnelForward,
+    };
     use uuid::Uuid;
 
     #[test]
@@ -289,6 +331,91 @@ mod tests {
         assert!(args.contains(&"pod/my-pod-abc".to_string()));
         assert!(args.contains(&"-n".to_string()));
         assert!(args.contains(&"kube-system".to_string()));
+    }
+
+    fn make_sshuttle_entry(
+        host: &str,
+        port: Option<u16>,
+        user: Option<&str>,
+        identity_file: Option<&str>,
+        subnets: &[&str],
+    ) -> SshuttleEntry {
+        SshuttleEntry {
+            id: Uuid::new_v4(),
+            name: "test-vpn".to_string(),
+            host: host.to_string(),
+            port,
+            user: user.map(|s| s.to_string()),
+            identity_file: identity_file.map(|s| s.to_string()),
+            subnets: subnets.iter().map(|s| s.to_string()).collect(),
+            auto_restart: false,
+        }
+    }
+
+    #[test]
+    fn test_build_sshuttle_command_minimal() {
+        let entry = make_sshuttle_entry("bastion.example.com", None, None, None, &["10.0.0.0/8"]);
+        let cmd = build_sshuttle_command(&entry);
+
+        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(prog, "sshuttle");
+        assert!(args.contains(&"-r".to_string()));
+        assert!(args.contains(&"bastion.example.com".to_string()));
+        assert!(args.contains(&"10.0.0.0/8".to_string()));
+        assert!(!args.contains(&"-e".to_string()));
+    }
+
+    #[test]
+    fn test_build_sshuttle_command_full() {
+        let entry = make_sshuttle_entry(
+            "bastion.example.com",
+            Some(2222),
+            Some("alice"),
+            Some("~/.ssh/id_ed25519"),
+            &["10.0.0.0/8", "192.168.0.0/16"],
+        );
+        let cmd = build_sshuttle_command(&entry);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        // Remote arg should be user@host:port
+        let r_idx = args.iter().position(|a| a == "-r").expect("-r not found");
+        assert_eq!(args[r_idx + 1], "alice@bastion.example.com:2222");
+
+        // Identity file via -e
+        assert!(args.contains(&"-e".to_string()));
+        let e_idx = args.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(args[e_idx + 1], "ssh -i ~/.ssh/id_ed25519");
+
+        // Both subnets present
+        assert!(args.contains(&"10.0.0.0/8".to_string()));
+        assert!(args.contains(&"192.168.0.0/16".to_string()));
+    }
+
+    #[test]
+    fn test_build_sshuttle_command_no_user_no_port() {
+        let entry = make_sshuttle_entry("vpn.example.com", None, None, None, &["172.16.0.0/12"]);
+        let cmd = build_sshuttle_command(&entry);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        let r_idx = args.iter().position(|a| a == "-r").expect("-r not found");
+        // Should be bare hostname with no @ or :
+        assert_eq!(args[r_idx + 1], "vpn.example.com");
     }
 
     /// Integration test: spawn a detached `sleep` process and verify the PID

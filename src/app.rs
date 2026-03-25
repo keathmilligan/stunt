@@ -7,15 +7,15 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::{
-    self, Config, K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, TunnelEntry,
-    TunnelForward,
+    self, Config, K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry,
+    TunnelEntry, TunnelForward,
 };
 use crate::config::{SessionRecord, SessionState, load_sessions, save_sessions};
 #[cfg(unix)]
 use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
     ConnectionState, Supervisor, TunnelEvent, TunnelProcessType, build_kubectl_command,
-    build_ssh_command,
+    build_ssh_command, build_sshuttle_command,
 };
 
 /// How long transient status messages are shown (in seconds).
@@ -60,6 +60,8 @@ pub enum FormEntryType {
     Ssh,
     /// Kubernetes workload entry.
     K8s,
+    /// sshuttle VPN-over-SSH entry.
+    Sshuttle,
 }
 
 /// State for the entry form (new or edit).
@@ -163,6 +165,8 @@ pub struct App {
     pub mode: AppMode,
     /// Warning message to show when kubectl is unavailable (persisted until dismissed).
     pub kubectl_warning: Option<String>,
+    /// Warning message to show when sshuttle is unavailable (persisted until dismissed).
+    pub sshuttle_warning: Option<String>,
 }
 
 impl App {
@@ -187,6 +191,7 @@ impl App {
             running: true,
             mode: AppMode::Normal,
             kubectl_warning: None,
+            sshuttle_warning: None,
         };
 
         app.reconcile_sessions();
@@ -196,6 +201,11 @@ impl App {
     /// Set a kubectl availability warning (shown in status bar).
     pub fn set_kubectl_warning(&mut self, msg: impl Into<String>) {
         self.kubectl_warning = Some(msg.into());
+    }
+
+    /// Set an sshuttle availability warning (shown in status bar).
+    pub fn set_sshuttle_warning(&mut self, msg: impl Into<String>) {
+        self.sshuttle_warning = Some(msg.into());
     }
 
     /// Get the active status message if it hasn't expired.
@@ -264,6 +274,9 @@ impl App {
                         TunnelEntry::K8s(e) => {
                             self.mode = AppMode::Form(Self::k8s_entry_to_form(e));
                         }
+                        TunnelEntry::Sshuttle(e) => {
+                            self.mode = AppMode::Form(Self::sshuttle_entry_to_form(e));
+                        }
                     }
                 }
             }
@@ -330,7 +343,7 @@ impl App {
                 }
             }
             Message::NavigateDown | Message::FormNextField => {
-                if sel.selected < 1 {
+                if sel.selected < 2 {
                     sel.selected += 1;
                 }
             }
@@ -340,7 +353,7 @@ impl App {
                     AppMode::TypeSelect(s) => s,
                     _ => return,
                 };
-                s.selected = (s.selected + 1) % 2;
+                s.selected = (s.selected + 1) % 3;
             }
             Message::FormSubmit => {
                 let entry_type_idx = match &self.mode {
@@ -348,10 +361,10 @@ impl App {
                     _ => return,
                 };
                 // Transition to the appropriate form
-                if entry_type_idx == 0 {
-                    self.mode = AppMode::Form(Self::new_ssh_form());
-                } else {
-                    self.mode = AppMode::Form(Self::new_k8s_form());
+                match entry_type_idx {
+                    0 => self.mode = AppMode::Form(Self::new_ssh_form()),
+                    1 => self.mode = AppMode::Form(Self::new_k8s_form()),
+                    _ => self.mode = AppMode::Form(Self::new_sshuttle_form()),
                 }
             }
             Message::FormCancel | Message::Quit => {
@@ -374,6 +387,12 @@ impl App {
         match msg {
             Message::FormNextField => {
                 match form.entry_type {
+                    FormEntryType::Sshuttle => {
+                        // Sshuttle form: only server fields, no forwards sub-form
+                        if form.focused_field < form.fields.len() - 1 {
+                            form.focused_field += 1;
+                        }
+                    }
                     FormEntryType::K8s => {
                         // K8s form: simple field cycling + k8s forward list
                         match form.focus {
@@ -422,6 +441,11 @@ impl App {
                 }
             }
             Message::FormPrevField => match form.entry_type {
+                FormEntryType::Sshuttle => {
+                    if form.focused_field > 0 {
+                        form.focused_field -= 1;
+                    }
+                }
                 FormEntryType::K8s => match form.focus {
                     FormFocus::ServerFields => {
                         if form.focused_field > 0 {
@@ -512,6 +536,7 @@ impl App {
                 }
             },
             Message::FormAddForward => match form.entry_type {
+                FormEntryType::Sshuttle => { /* sshuttle has no forwards */ }
                 FormEntryType::Ssh => match form.focus {
                     FormFocus::ForwardEdit { .. } => {
                         if let Some(fwd) = self.build_ssh_forward_from_form() {
@@ -563,6 +588,7 @@ impl App {
             },
             Message::FormDeleteForward => match form.focus {
                 FormFocus::ForwardEdit { .. } => match form.entry_type {
+                    FormEntryType::Sshuttle => { /* no forwards */ }
                     FormEntryType::Ssh => {
                         if form.forwards.is_empty() {
                             form.focus = FormFocus::ServerFields;
@@ -585,6 +611,7 @@ impl App {
                     }
                 },
                 FormFocus::ForwardList => match form.entry_type {
+                    FormEntryType::Sshuttle => { /* no forwards */ }
                     FormEntryType::Ssh => {
                         if !form.forwards.is_empty() {
                             form.forwards.remove(form.selected_forward);
@@ -617,6 +644,7 @@ impl App {
             Message::FormCycleForwardType => {
                 if matches!(form.focus, FormFocus::ForwardEdit { .. }) {
                     match form.entry_type {
+                        FormEntryType::Sshuttle => { /* no forward types */ }
                         FormEntryType::Ssh => {
                             form.forward_type = (form.forward_type + 1) % 3;
                             form.forward_fields = Self::default_ssh_forward_fields();
@@ -635,6 +663,7 @@ impl App {
                         if matches!(form.focus, FormFocus::ForwardEdit { .. }) =>
                     {
                         match form.entry_type {
+                            FormEntryType::Sshuttle => { /* no forwards */ }
                             FormEntryType::Ssh => {
                                 if let Some(fwd) = self.build_ssh_forward_from_form() {
                                     self.commit_ssh_forward(fwd);
@@ -666,6 +695,7 @@ impl App {
                     }
                     AppMode::Form(ref form) if matches!(form.focus, FormFocus::ForwardList) => {
                         match form.entry_type {
+                            FormEntryType::Sshuttle => { /* no forwards */ }
                             FormEntryType::Ssh => {
                                 let idx = form.selected_forward;
                                 if let Some(fwd) = form.forwards.get(idx) {
@@ -712,6 +742,7 @@ impl App {
                 match form.focus {
                     FormFocus::ForwardEdit { .. } => {
                         let is_empty = match form.entry_type {
+                            FormEntryType::Sshuttle => true,
                             FormEntryType::Ssh => form.forwards.is_empty(),
                             FormEntryType::K8s => form.k8s_forwards.is_empty(),
                         };
@@ -719,6 +750,7 @@ impl App {
                             form.focus = FormFocus::ServerFields;
                         } else {
                             let len = match form.entry_type {
+                                FormEntryType::Sshuttle => 0,
                                 FormEntryType::Ssh => form.forwards.len(),
                                 FormEntryType::K8s => form.k8s_forwards.len(),
                             };
@@ -821,6 +853,102 @@ impl App {
             forward_field: 0,
             forward_type: 0,
             forward_fields: Self::default_k8s_forward_fields(),
+            k8s_forwards: vec![],
+        }
+    }
+
+    /// Build a new empty sshuttle entry form.
+    fn new_sshuttle_form() -> FormState {
+        FormState {
+            focused_field: 0,
+            editing_id: None,
+            entry_type: FormEntryType::Sshuttle,
+            fields: vec![
+                FormField {
+                    label: "Name".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Host".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Subnets".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Port".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "User".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Identity File".to_string(),
+                    value: String::new(),
+                },
+                FormField {
+                    label: "Auto Restart".to_string(),
+                    value: "no".to_string(),
+                },
+            ],
+            forwards: vec![],
+            focus: FormFocus::ServerFields,
+            selected_forward: 0,
+            forward_field: 0,
+            forward_type: 0,
+            forward_fields: vec![],
+            k8s_forwards: vec![],
+        }
+    }
+
+    /// Build a form pre-populated from an existing sshuttle entry.
+    fn sshuttle_entry_to_form(entry: &SshuttleEntry) -> FormState {
+        FormState {
+            focused_field: 0,
+            editing_id: Some(entry.id),
+            entry_type: FormEntryType::Sshuttle,
+            fields: vec![
+                FormField {
+                    label: "Name".to_string(),
+                    value: entry.name.clone(),
+                },
+                FormField {
+                    label: "Host".to_string(),
+                    value: entry.host.clone(),
+                },
+                FormField {
+                    label: "Subnets".to_string(),
+                    value: entry.subnets.join(", "),
+                },
+                FormField {
+                    label: "Port".to_string(),
+                    value: entry.port.map(|p| p.to_string()).unwrap_or_default(),
+                },
+                FormField {
+                    label: "User".to_string(),
+                    value: entry.user.clone().unwrap_or_default(),
+                },
+                FormField {
+                    label: "Identity File".to_string(),
+                    value: entry.identity_file.clone().unwrap_or_default(),
+                },
+                FormField {
+                    label: "Auto Restart".to_string(),
+                    value: if entry.auto_restart {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    },
+                },
+            ],
+            forwards: vec![],
+            focus: FormFocus::ServerFields,
+            selected_forward: 0,
+            forward_field: 0,
+            forward_type: 0,
+            forward_fields: vec![],
             k8s_forwards: vec![],
         }
     }
@@ -1157,6 +1285,7 @@ impl App {
         match form.entry_type {
             FormEntryType::Ssh => self.submit_ssh_form(form),
             FormEntryType::K8s => self.submit_k8s_form(form),
+            FormEntryType::Sshuttle => self.submit_sshuttle_form(form),
         }
     }
 
@@ -1277,6 +1406,79 @@ impl App {
         self.mode = AppMode::Normal;
     }
 
+    /// Submit a sshuttle entry form.
+    fn submit_sshuttle_form(&mut self, form: FormState) {
+        let name = form.fields[0].value.trim().to_string();
+        let host = form.fields[1].value.trim().to_string();
+        let subnets: Vec<String> = form.fields[2]
+            .value
+            .split([',', '\n'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let port = {
+            let val = form.fields[3].value.trim().to_string();
+            if val.is_empty() {
+                None
+            } else {
+                val.parse::<u16>().ok()
+            }
+        };
+        let user = {
+            let val = form.fields[4].value.trim().to_string();
+            if val.is_empty() { None } else { Some(val) }
+        };
+        let identity_file = {
+            let val = form.fields[5].value.trim().to_string();
+            if val.is_empty() { None } else { Some(val) }
+        };
+        let auto_restart = form.fields[6].value.trim().eq_ignore_ascii_case("yes");
+
+        if name.is_empty() || host.is_empty() {
+            self.set_status("Name and Host are required");
+            return;
+        }
+        if subnets.is_empty() {
+            self.set_status("At least one subnet is required");
+            return;
+        }
+
+        if let Some(id) = form.editing_id {
+            if let Some(entry) = self.entries.iter_mut().find(|e| e.id() == id)
+                && let TunnelEntry::Sshuttle(s) = entry
+            {
+                s.name = name;
+                s.host = host;
+                s.subnets = subnets;
+                s.port = port;
+                s.user = user;
+                s.identity_file = identity_file;
+                s.auto_restart = auto_restart;
+            }
+            self.set_status("Entry updated");
+        } else {
+            let id = Uuid::new_v4();
+            let entry = TunnelEntry::Sshuttle(SshuttleEntry {
+                id,
+                name,
+                host,
+                port,
+                user,
+                identity_file,
+                subnets,
+                auto_restart,
+            });
+            self.entries.push(entry);
+            self.connection_states
+                .insert(id, ConnectionState::Disconnected);
+            self.selected = self.entries.len() - 1;
+            self.set_status("Entry created");
+        }
+
+        self.save_config();
+        self.mode = AppMode::Normal;
+    }
+
     // ── Connection management ──────────────────────────────────────────────
 
     /// Initiate a connection for the entry at the given index.
@@ -1321,6 +1523,16 @@ impl App {
                     k8s_entry.auto_restart,
                     TunnelProcessType::Kubectl,
                     Box::new(move || build_kubectl_command(&k8s_entry, &forward)),
+                    self.tunnel_tx.clone(),
+                )
+            }
+            TunnelEntry::Sshuttle(sshuttle_entry) => {
+                let sshuttle_entry = sshuttle_entry.clone();
+                Supervisor::spawn(
+                    id,
+                    sshuttle_entry.auto_restart,
+                    TunnelProcessType::Sshuttle,
+                    Box::new(move || build_sshuttle_command(&sshuttle_entry)),
                     self.tunnel_tx.clone(),
                 )
             }
@@ -1481,6 +1693,7 @@ impl App {
                 .map(|e| match e {
                     TunnelEntry::Ssh(_) => TunnelProcessType::Ssh,
                     TunnelEntry::K8s(_) => TunnelProcessType::Kubectl,
+                    TunnelEntry::Sshuttle(_) => TunnelProcessType::Sshuttle,
                 })
                 .unwrap_or(TunnelProcessType::Ssh);
 
@@ -1521,6 +1734,17 @@ impl App {
                             auto_restart,
                             TunnelProcessType::Kubectl,
                             Box::new(move || build_kubectl_command(&k8s, &forward)),
+                            self.tunnel_tx.clone(),
+                        )
+                    }
+                    TunnelEntry::Sshuttle(sshuttle) => {
+                        let sshuttle = sshuttle.clone();
+                        Supervisor::adopt(
+                            id,
+                            pid,
+                            auto_restart,
+                            TunnelProcessType::Sshuttle,
+                            Box::new(move || build_sshuttle_command(&sshuttle)),
                             self.tunnel_tx.clone(),
                         )
                     }

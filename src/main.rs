@@ -43,6 +43,18 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Warn if sshuttle is unavailable and sshuttle entries are configured
+    let has_sshuttle_entries = cfg
+        .entries
+        .iter()
+        .any(|e| matches!(e, TunnelEntry::Sshuttle(_)));
+    if has_sshuttle_entries && !tunnel::check_sshuttle_available() {
+        app.set_sshuttle_warning(
+            "sshuttle not found on PATH — sshuttle tunnels unavailable. Install sshuttle to use these entries."
+                .to_string(),
+        );
+    }
+
     // Initialize terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();

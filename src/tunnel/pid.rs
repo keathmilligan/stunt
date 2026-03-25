@@ -13,6 +13,8 @@ pub enum TunnelProcessType {
     Ssh,
     /// A Kubernetes port-forward process (`kubectl` binary).
     Kubectl,
+    /// An sshuttle VPN-over-SSH process (`sshuttle` binary).
+    Sshuttle,
 }
 
 /// Check whether a process with the given PID is alive.
@@ -54,6 +56,7 @@ pub fn is_expected_process(pid: u32, process_type: TunnelProcessType) -> bool {
             match process_type {
                 TunnelProcessType::Ssh => name == "ssh" || name.starts_with("ssh"),
                 TunnelProcessType::Kubectl => name == "kubectl" || name.starts_with("kubectl"),
+                TunnelProcessType::Sshuttle => name == "sshuttle" || name.starts_with("sshuttle"),
             }
         }
         Err(_) => {
@@ -160,6 +163,39 @@ mod tests {
             assert!(
                 !is_live_tunnel(pid, TunnelProcessType::Kubectl),
                 "dead PID should not be a live kubectl tunnel"
+            );
+        }
+    }
+
+    #[test]
+    fn test_current_process_is_not_sshuttle() {
+        let pid = std::process::id();
+        if std::path::Path::new("/proc").exists() {
+            assert!(
+                !is_expected_process(pid, TunnelProcessType::Sshuttle),
+                "test runner should not be identified as sshuttle"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_live_tunnel_sshuttle_current_process() {
+        let pid = std::process::id();
+        if std::path::Path::new("/proc").exists() {
+            assert!(
+                !is_live_tunnel(pid, TunnelProcessType::Sshuttle),
+                "test runner should not be a live sshuttle tunnel"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_live_tunnel_sshuttle_dead_pid() {
+        let pid = 4_000_000;
+        if !is_pid_alive(pid) {
+            assert!(
+                !is_live_tunnel(pid, TunnelProcessType::Sshuttle),
+                "dead PID should not be a live sshuttle tunnel"
             );
         }
     }

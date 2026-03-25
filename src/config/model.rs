@@ -11,7 +11,7 @@ pub struct Config {
     pub entries: Vec<TunnelEntry>,
 }
 
-/// A tunnel entry — either an SSH server or a Kubernetes workload target.
+/// A tunnel entry — either an SSH server, a Kubernetes workload target, or an sshuttle VPN session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TunnelEntry {
@@ -19,6 +19,8 @@ pub enum TunnelEntry {
     Ssh(ServerEntry),
     /// A Kubernetes workload target with port-forward bindings.
     K8s(K8sEntry),
+    /// An sshuttle VPN-over-SSH session routing one or more subnets.
+    Sshuttle(SshuttleEntry),
 }
 
 impl TunnelEntry {
@@ -27,6 +29,7 @@ impl TunnelEntry {
         match self {
             TunnelEntry::Ssh(e) => e.id,
             TunnelEntry::K8s(e) => e.id,
+            TunnelEntry::Sshuttle(e) => e.id,
         }
     }
 
@@ -35,6 +38,7 @@ impl TunnelEntry {
         match self {
             TunnelEntry::Ssh(e) => &e.name,
             TunnelEntry::K8s(e) => &e.name,
+            TunnelEntry::Sshuttle(e) => &e.name,
         }
     }
 
@@ -43,6 +47,7 @@ impl TunnelEntry {
         match self {
             TunnelEntry::Ssh(e) => e.auto_restart,
             TunnelEntry::K8s(e) => e.auto_restart,
+            TunnelEntry::Sshuttle(e) => e.auto_restart,
         }
     }
 }
@@ -181,6 +186,41 @@ impl K8sPortForward {
     pub fn display_address(&self) -> String {
         format!("{} -> :{}", self.local_port, self.remote_port)
     }
+}
+
+/// An sshuttle VPN-over-SSH session routing one or more subnets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SshuttleEntry {
+    /// Unique identifier for this entry.
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+
+    /// Display name for this entry.
+    pub name: String,
+
+    /// SSH server hostname or IP address.
+    pub host: String,
+
+    /// SSH server port (uses sshuttle default if omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+
+    /// SSH username (uses system default if omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Path to the SSH identity (private key) file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+
+    /// Subnets to route through the tunnel (e.g. `["10.0.0.0/8"]`).
+    #[serde(default)]
+    pub subnets: Vec<String>,
+
+    /// Whether to automatically restart this tunnel on unexpected disconnect.
+    /// Only active while the TUI is running.
+    #[serde(default)]
+    pub auto_restart: bool,
 }
 
 /// An SSH port-forwarding definition.
@@ -560,5 +600,109 @@ mod tests {
         assert_eq!(K8sResourceType::Pod.as_str(), "pod");
         assert_eq!(K8sResourceType::Service.as_str(), "service");
         assert_eq!(K8sResourceType::Deployment.as_str(), "deployment");
+    }
+
+    // ── SshuttleEntry tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_sshuttle_entry_minimal_defaults() {
+        let toml_str = r#"
+            [[entries]]
+            type = "sshuttle"
+            name = "vpn"
+            host = "bastion.example.com"
+            subnets = ["10.0.0.0/8"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.entries.len(), 1);
+        let TunnelEntry::Sshuttle(entry) = &config.entries[0] else {
+            panic!("expected Sshuttle entry");
+        };
+        assert_eq!(entry.name, "vpn");
+        assert_eq!(entry.host, "bastion.example.com");
+        assert_eq!(entry.subnets, vec!["10.0.0.0/8"]);
+        assert!(entry.port.is_none());
+        assert!(entry.user.is_none());
+        assert!(entry.identity_file.is_none());
+        assert!(!entry.auto_restart);
+    }
+
+    #[test]
+    fn test_sshuttle_entry_full_round_trip() {
+        let config = Config {
+            entries: vec![TunnelEntry::Sshuttle(SshuttleEntry {
+                id: Uuid::new_v4(),
+                name: "corp-vpn".to_string(),
+                host: "bastion.example.com".to_string(),
+                port: Some(2222),
+                user: Some("alice".to_string()),
+                identity_file: Some("~/.ssh/id_ed25519".to_string()),
+                subnets: vec!["10.0.0.0/8".to_string(), "192.168.0.0/16".to_string()],
+                auto_restart: true,
+            })],
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn test_mixed_ssh_k8s_sshuttle_round_trip() {
+        let config = Config {
+            entries: vec![
+                TunnelEntry::Ssh(ServerEntry {
+                    id: Uuid::new_v4(),
+                    name: "bastion".to_string(),
+                    host: "bastion.example.com".to_string(),
+                    port: 22,
+                    user: None,
+                    identity_file: None,
+                    forwards: vec![],
+                    auto_restart: false,
+                }),
+                TunnelEntry::K8s(K8sEntry {
+                    id: Uuid::new_v4(),
+                    name: "api-debug".to_string(),
+                    context: None,
+                    namespace: None,
+                    resource_type: K8sResourceType::Deployment,
+                    resource_name: "api".to_string(),
+                    forwards: vec![],
+                    auto_restart: false,
+                }),
+                TunnelEntry::Sshuttle(SshuttleEntry {
+                    id: Uuid::new_v4(),
+                    name: "corp-vpn".to_string(),
+                    host: "vpn.example.com".to_string(),
+                    port: None,
+                    user: None,
+                    identity_file: None,
+                    subnets: vec!["10.0.0.0/8".to_string()],
+                    auto_restart: false,
+                }),
+            ],
+        };
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(config, deserialized);
+        assert!(matches!(deserialized.entries[0], TunnelEntry::Ssh(_)));
+        assert!(matches!(deserialized.entries[1], TunnelEntry::K8s(_)));
+        assert!(matches!(deserialized.entries[2], TunnelEntry::Sshuttle(_)));
+    }
+
+    #[test]
+    fn test_tunnel_entry_helpers_sshuttle() {
+        let entry = TunnelEntry::Sshuttle(SshuttleEntry {
+            id: Uuid::new_v4(),
+            name: "my-vpn".to_string(),
+            host: "vpn.example.com".to_string(),
+            port: None,
+            user: None,
+            identity_file: None,
+            subnets: vec!["10.0.0.0/8".to_string()],
+            auto_restart: true,
+        });
+        assert_eq!(entry.name(), "my-vpn");
+        assert!(entry.auto_restart());
     }
 }

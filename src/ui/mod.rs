@@ -36,6 +36,8 @@ const COLOR_STATUS_BG: Color = Color::DarkGray;
 const COLOR_SELECTED_BG: Color = Color::Rgb(30, 40, 60);
 /// Color for K8s entry type indicator.
 const COLOR_K8S_LABEL: Color = Color::Rgb(100, 180, 255);
+/// Color for sshuttle entry type indicator.
+const COLOR_SSHUTTLE_LABEL: Color = Color::Rgb(180, 140, 255);
 
 // ── Public entry point ─────────────────────────────────────────────────
 
@@ -120,11 +122,12 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         summary.push_str(&format!("  {suspended} suspended"));
     }
 
-    // Show kubectl warning in status bar if present and no transient message
+    // Show transient message, kubectl warning, or sshuttle warning (in priority order)
     let display_msg = app
         .active_status_message()
         .map(|s| s.to_string())
-        .or_else(|| app.kubectl_warning.as_ref().map(|w| format!("⚠ {w}")));
+        .or_else(|| app.kubectl_warning.as_ref().map(|w| format!("⚠ {w}")))
+        .or_else(|| app.sshuttle_warning.as_ref().map(|w| format!("⚠ {w}")));
 
     let line = if let Some(msg) = display_msg {
         let available = area.width as usize;
@@ -165,6 +168,8 @@ fn entry_row_height(entry: &TunnelEntry) -> u16 {
         TunnelEntry::Ssh(e) => 1 + e.forwards.len() as u16,
         // Header line + one line per K8s port-forward binding (minimum 1 total)
         TunnelEntry::K8s(e) => 1 + e.forwards.len() as u16,
+        // sshuttle: single header line
+        TunnelEntry::Sshuttle(_) => 1,
     }
     .max(1)
 }
@@ -268,6 +273,9 @@ fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
         match entry {
             TunnelEntry::Ssh(ssh) => render_ssh_entry_row(frame, row_area, ssh, state, is_selected),
             TunnelEntry::K8s(k8s) => render_k8s_entry_row(frame, row_area, k8s, state, is_selected),
+            TunnelEntry::Sshuttle(s) => {
+                render_sshuttle_entry_row(frame, row_area, s, state, is_selected)
+            }
         }
 
         y_offset += h as u16;
@@ -448,6 +456,64 @@ fn render_k8s_entry_row(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Render a single sshuttle entry row.
+fn render_sshuttle_entry_row(
+    frame: &mut Frame,
+    area: Rect,
+    entry: &crate::config::SshuttleEntry,
+    state: ConnectionState,
+    is_selected: bool,
+) {
+    let bg = if is_selected {
+        COLOR_SELECTED_BG
+    } else {
+        Color::Reset
+    };
+
+    let state_color = state_to_color(state);
+    let state_indicator = format!("[{}]", state.label());
+    let subnet_count = entry.subnets.len();
+    let subnet_summary = if subnet_count == 1 {
+        entry.subnets[0].clone()
+    } else {
+        format!("{subnet_count} subnets")
+    };
+
+    let mut spans = vec![
+        Span::styled("  ", Style::default().bg(bg)),
+        Span::styled("[VPN] ", Style::default().fg(COLOR_SSHUTTLE_LABEL).bg(bg)),
+        Span::styled(
+            format!("{} ", entry.name),
+            Style::default()
+                .fg(Color::White)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{state_indicator} "),
+            Style::default().fg(state_color).bg(bg),
+        ),
+        Span::styled(
+            format!("{} → {}", entry.host, subnet_summary),
+            Style::default().fg(COLOR_SSHUTTLE_LABEL).bg(bg),
+        ),
+    ];
+
+    if let Some(ref user) = entry.user {
+        spans.push(Span::styled(
+            format!("  user:{user}"),
+            Style::default().fg(Color::DarkGray).bg(bg),
+        ));
+    }
+
+    spans.push(Span::styled(
+        " ".repeat(area.width as usize),
+        Style::default().bg(bg),
+    ));
+
+    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
+}
+
 /// Map a `ConnectionState` to a display color.
 fn state_to_color(state: ConnectionState) -> Color {
     match state {
@@ -485,7 +551,7 @@ fn render_type_select_overlay(frame: &mut Frame, area: Rect, sel: &EntryTypeSele
     let inner = block.inner(overlay_area);
     frame.render_widget(block, overlay_area);
 
-    let options = ["SSH Server", "Kubernetes Workload"];
+    let options = ["SSH Server", "Kubernetes Workload", "sshuttle VPN"];
     let mut lines: Vec<Line> = vec![Line::from("")];
     for (i, opt) in options.iter().enumerate() {
         let is_selected = i == sel.selected;
@@ -519,6 +585,8 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         (FormEntryType::Ssh, true) => " Edit SSH Entry ",
         (FormEntryType::K8s, false) => " New K8s Entry ",
         (FormEntryType::K8s, true) => " Edit K8s Entry ",
+        (FormEntryType::Sshuttle, false) => " New sshuttle Entry ",
+        (FormEntryType::Sshuttle, true) => " Edit sshuttle Entry ",
     };
 
     let is_editing_forward = matches!(form.focus, FormFocus::ForwardEdit { .. });
@@ -528,6 +596,7 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
     let forward_lines = match form.entry_type {
         FormEntryType::Ssh => form.forwards.len() as u16,
         FormEntryType::K8s => form.k8s_forwards.len() as u16,
+        FormEntryType::Sshuttle => 0,
     };
     let editing_fwd_lines = if is_editing_forward { 4 } else { 0 };
     let form_height =
@@ -622,71 +691,75 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         }
     }
 
-    // Blank line before forwards section
-    lines.push(Line::from(""));
+    // Blank line before forwards section (only for entry types that have forwards)
+    if !matches!(form.entry_type, FormEntryType::Sshuttle) {
+        lines.push(Line::from(""));
 
-    // Forwards header
-    let hints = match form.focus {
-        FormFocus::ForwardList => "(Enter edit  Ctrl+A add  Ctrl+D del)",
-        FormFocus::ForwardEdit { .. } => "(Enter save  Esc cancel)",
-        FormFocus::ServerFields => "(Ctrl+A add  Tab to list)",
-    };
-    let fwd_section_label = match form.entry_type {
-        FormEntryType::Ssh => "  Forwards ",
-        FormEntryType::K8s => "  Port Bindings ",
-    };
-    lines.push(Line::from(vec![
-        Span::styled(
-            fwd_section_label,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(hints, Style::default().fg(Color::DarkGray)),
-    ]));
+        // Forwards header
+        let hints = match form.focus {
+            FormFocus::ForwardList => "(Enter edit  Ctrl+A add  Ctrl+D del)",
+            FormFocus::ForwardEdit { .. } => "(Enter save  Esc cancel)",
+            FormFocus::ServerFields => "(Ctrl+A add  Tab to list)",
+        };
+        let fwd_section_label = match form.entry_type {
+            FormEntryType::Ssh => "  Forwards ",
+            FormEntryType::K8s => "  Port Bindings ",
+            FormEntryType::Sshuttle => unreachable!(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                fwd_section_label,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(hints, Style::default().fg(Color::DarkGray)),
+        ]));
 
-    // Existing forwards
-    let in_forward_list = matches!(form.focus, FormFocus::ForwardList);
-    match form.entry_type {
-        FormEntryType::Ssh => {
-            for (i, fwd) in form.forwards.iter().enumerate() {
-                let type_label = fwd.type_label();
-                let addr = fwd.display_address();
-                let is_sel = in_forward_list && i == form.selected_forward;
-                let (type_style, addr_style) = forward_styles(is_sel);
-                let prefix = if is_sel { "  > " } else { "    " };
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{prefix}[{type_label}] "), type_style),
-                    Span::styled(addr, addr_style),
-                ]));
+        // Existing forwards
+        let in_forward_list = matches!(form.focus, FormFocus::ForwardList);
+        match form.entry_type {
+            FormEntryType::Ssh => {
+                for (i, fwd) in form.forwards.iter().enumerate() {
+                    let type_label = fwd.type_label();
+                    let addr = fwd.display_address();
+                    let is_sel = in_forward_list && i == form.selected_forward;
+                    let (type_style, addr_style) = forward_styles(is_sel);
+                    let prefix = if is_sel { "  > " } else { "    " };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{prefix}[{type_label}] "), type_style),
+                        Span::styled(addr, addr_style),
+                    ]));
+                }
+                if form.forwards.is_empty() && !is_editing_forward {
+                    lines.push(Line::from(vec![Span::styled(
+                        "    (none — Ctrl+A to add)",
+                        Style::default().fg(Color::DarkGray),
+                    )]));
+                }
             }
-            if form.forwards.is_empty() && !is_editing_forward {
-                lines.push(Line::from(vec![Span::styled(
-                    "    (none — Ctrl+A to add)",
-                    Style::default().fg(Color::DarkGray),
-                )]));
+            FormEntryType::K8s => {
+                for (i, fwd) in form.k8s_forwards.iter().enumerate() {
+                    let addr = fwd.display_address();
+                    let is_sel = in_forward_list && i == form.selected_forward;
+                    let (_type_style, addr_style) = forward_styles(is_sel);
+                    let prefix = if is_sel { "  > " } else { "    " };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{prefix}[K] "),
+                            Style::default().fg(COLOR_K8S_LABEL),
+                        ),
+                        Span::styled(addr, addr_style),
+                    ]));
+                }
+                if form.k8s_forwards.is_empty() && !is_editing_forward {
+                    lines.push(Line::from(vec![Span::styled(
+                        "    (none — Ctrl+A to add)",
+                        Style::default().fg(Color::DarkGray),
+                    )]));
+                }
             }
-        }
-        FormEntryType::K8s => {
-            for (i, fwd) in form.k8s_forwards.iter().enumerate() {
-                let addr = fwd.display_address();
-                let is_sel = in_forward_list && i == form.selected_forward;
-                let (_type_style, addr_style) = forward_styles(is_sel);
-                let prefix = if is_sel { "  > " } else { "    " };
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{prefix}[K] "),
-                        Style::default().fg(COLOR_K8S_LABEL),
-                    ),
-                    Span::styled(addr, addr_style),
-                ]));
-            }
-            if form.k8s_forwards.is_empty() && !is_editing_forward {
-                lines.push(Line::from(vec![Span::styled(
-                    "    (none — Ctrl+A to add)",
-                    Style::default().fg(Color::DarkGray),
-                )]));
-            }
+            FormEntryType::Sshuttle => unreachable!(),
         }
     }
 
@@ -710,6 +783,7 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                 format!("{editing_label} — Type: {type_name}  (Ctrl+T to cycle)")
             }
             FormEntryType::K8s => format!("{editing_label} — kubectl port-forward"),
+            FormEntryType::Sshuttle => unreachable!("sshuttle has no forward sub-form"),
         };
 
         lines.push(Line::from(vec![Span::styled(
@@ -726,6 +800,7 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                 }
             }
             FormEntryType::K8s => 2,
+            FormEntryType::Sshuttle => unreachable!("sshuttle has no forward sub-form"),
         };
 
         for (fi, field) in form.forward_fields.iter().enumerate().take(num_fields) {

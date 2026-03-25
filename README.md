@@ -21,7 +21,7 @@
 [![Install Scripts](https://packages.keathmilligan.net/stunt/badges/install-scripts.svg)](https://github.com/keathmilligan/stunt/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-**S**tupid **Tun**nel **T**ricks — a terminal user interface for defining, configuring, and managing SSH tunnel connections and Kubernetes port-forwards.
+**S**tupid **Tun**nel **T**ricks — a terminal user interface for defining, configuring, and managing SSH tunnel connections, Kubernetes port-forwards, and sshuttle VPN sessions.
 
 ## Features
 
@@ -39,6 +39,13 @@
 - Optional kubeconfig context and namespace per entry
 - Multiple port bindings per workload entry
 
+### sshuttle VPN Sessions
+
+- Route entire subnets through a remote host via [sshuttle](https://github.com/sshuttle/sshuttle)
+- Multiple subnets per entry (comma-separated in the form)
+- Optional SSH port, username, and identity file per entry
+- Linux and macOS only (sshuttle is not supported on Windows)
+
 ### Connection Management
 
 - Start and stop tunnels from a single dashboard
@@ -47,20 +54,20 @@
 - Suspended state — manual disconnect of an auto-restart tunnel suppresses reconnection
 - Session state persisted across restarts (PIDs tracked in `sessions.json`)
 - Adopts existing tunnel processes on startup if they are still alive
-- Warning when `kubectl` is unavailable but K8s entries are configured
+- Warning when `kubectl` or `sshuttle` is unavailable but entries of that type are configured
 
 ### Configuration
 
 - Configuration stored as TOML (`tunnels.toml`) in the platform data directory
 - Atomic saves with `.bak` backup on every write
 - Automatic migration of legacy `[[server]]` format to current `[[entries]]` format
-- Multiple port-forward definitions per entry
+- Multiple port-forward definitions per SSH and K8s entry
 
 ### UI
 
 - Full-screen TUI built with [ratatui](https://ratatui.rs/)
 - Create and edit entries with an in-app form (no editor required)
-- Type-selection step when creating a new entry (SSH or K8s)
+- Type-selection step when creating a new entry (SSH, K8s, or sshuttle)
 - In-line forward sub-form with type cycling (`Ctrl+T`)
 - Status bar with transient feedback messages
 
@@ -69,6 +76,7 @@
 - Rust 1.85+ (2024 edition)
 - A working `ssh` client on `$PATH` (for SSH tunnels)
 - `kubectl` on `$PATH` (for Kubernetes port-forwards)
+- `sshuttle` on `$PATH` (for sshuttle VPN sessions — Linux/macOS only)
 
 ## Installation
 
@@ -182,6 +190,20 @@ auto_restart = false
 ```
 
 Supported `resource_type` values: `pod`, `service`, `deployment`.
+
+### sshuttle Entry
+
+```toml
+[[entries]]
+type = "sshuttle"
+name = "corp-vpn"
+host = "bastion.example.com"
+subnets = ["10.0.0.0/8", "192.168.0.0/16"]
+port = 22                         # optional, uses sshuttle default if omitted
+user = "alice"                    # optional
+identity_file = "~/.ssh/id_ed25519"  # optional
+auto_restart = true               # optional, default false
+```
 
 ## Development
 

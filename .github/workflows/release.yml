@@ -23,3 +23,38 @@ jobs:
       tag: ${{ inputs.tag }}
       force: ${{ inputs.force }}
       package-name: stunt
+
+  publish:
+    needs: release
+    uses: keathmilligan/release-infra/.github/workflows/publish.yml@master
+    with:
+      tag: ${{ inputs.tag }}
+      project-name: stunt
+      binary-name: stunt
+      project-type: rust
+      targets: >-
+        x86_64-apple-darwin,
+        aarch64-apple-darwin,
+        x86_64-pc-windows-msvc,
+        aarch64-pc-windows-msvc,
+        x86_64-unknown-linux-gnu,
+        aarch64-unknown-linux-gnu,
+        x86_64-unknown-linux-musl,
+        aarch64-unknown-linux-musl
+      tap-repo: keathmilligan/homebrew-tap
+      bucket-repo: keathmilligan/scoop-bucket
+      packages-repo: keathmilligan/packages
+      enable-cargo: false
+      enable-install-scripts: true
+      enable-homebrew: true
+      enable-scoop: true
+      enable-chocolatey: false
+      enable-winget: false
+      enable-apt: true
+      enable-rpm: true
+      enable-apk: false
+      enable-dmg: true
+      enable-msi: true
+      enable-aur: false
+      enable-badges: true
+    secrets: inherit

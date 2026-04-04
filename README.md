@@ -22,6 +22,8 @@
 [![Install Scripts](https://packages.keathmilligan.net/stunt/badges/install-scripts.svg)](https://github.com/keathmilligan/stunt/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+https://github.com/user-attachments/assets/176c1ad8-4c27-4890-a080-060098b0db67
+
 ## Features
 
 `stunt` allows you to define tunnels with SSH, Kubernetes and `sshuttle` that persist when you close the app. 

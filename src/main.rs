@@ -2,12 +2,14 @@
 
 mod app;
 mod config;
+mod demo;
 mod event;
 mod tunnel;
 mod ui;
 
 use std::io;
 
+use clap::Parser;
 use crossterm::event::{KeyCode, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -20,39 +22,64 @@ use app::{App, AppMode, Message};
 use config::TunnelEntry;
 use event::AppEvent;
 
+/// STunT — Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections.
+#[derive(Parser)]
+#[command(name = "stunt", version, about)]
+struct Cli {
+    /// Launch in demo mode with simulated tunnels (no real connections).
+    #[arg(long)]
+    demo: bool,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Check that ssh is available on PATH
-    tunnel::check_ssh_available()?;
+    let cli = Cli::parse();
 
-    // Load configuration
-    let cfg = config::load()?;
+    // Load configuration (or build demo fixtures)
+    let cfg = if cli.demo {
+        config::Config {
+            entries: demo::demo_entries(),
+        }
+    } else {
+        // Check that ssh is available on PATH (only in normal mode)
+        tunnel::check_ssh_available()?;
+        config::load()?
+    };
 
     // Start the event loop (terminal + tunnel event channels)
     let (tunnel_tx, mut app_rx) = event::start_event_loop();
 
     // Create the application
-    let mut app = App::new(cfg.clone(), tunnel_tx);
+    let mut app = App::new(cfg.clone(), tunnel_tx.clone(), cli.demo);
 
-    // Warn if kubectl is unavailable and K8s entries are configured
-    let has_k8s_entries = cfg.entries.iter().any(|e| matches!(e, TunnelEntry::K8s(_)));
-    if has_k8s_entries && !tunnel::check_kubectl_available() {
-        app.set_kubectl_warning(
-            "kubectl not found on PATH — K8s tunnels unavailable. Install kubectl to use K8s entries."
-                .to_string(),
-        );
-    }
+    // Start demo simulation if in demo mode
+    let demo_cancel = if cli.demo {
+        Some(demo::start_demo(&cfg.entries, tunnel_tx))
+    } else {
+        None
+    };
 
-    // Warn if sshuttle is unavailable and sshuttle entries are configured
-    let has_sshuttle_entries = cfg
-        .entries
-        .iter()
-        .any(|e| matches!(e, TunnelEntry::Sshuttle(_)));
-    if has_sshuttle_entries && !tunnel::check_sshuttle_available() {
-        app.set_sshuttle_warning(
-            "sshuttle not found on PATH — sshuttle tunnels unavailable. Install sshuttle to use these entries."
-                .to_string(),
-        );
+    if !cli.demo {
+        // Warn if kubectl is unavailable and K8s entries are configured
+        let has_k8s_entries = cfg.entries.iter().any(|e| matches!(e, TunnelEntry::K8s(_)));
+        if has_k8s_entries && !tunnel::check_kubectl_available() {
+            app.set_kubectl_warning(
+                "kubectl not found on PATH — K8s tunnels unavailable. Install kubectl to use K8s entries."
+                    .to_string(),
+            );
+        }
+
+        // Warn if sshuttle is unavailable and sshuttle entries are configured
+        let has_sshuttle_entries = cfg
+            .entries
+            .iter()
+            .any(|e| matches!(e, TunnelEntry::Sshuttle(_)));
+        if has_sshuttle_entries && !tunnel::check_sshuttle_available() {
+            app.set_sshuttle_warning(
+                "sshuttle not found on PATH — sshuttle tunnels unavailable. Install sshuttle to use these entries."
+                    .to_string(),
+            );
+        }
     }
 
     // Initialize terminal
@@ -79,10 +106,38 @@ async fn main() -> anyhow::Result<()> {
                             KeyCode::Char('q') => Some(Message::Quit),
                             KeyCode::Up | KeyCode::Char('k') => Some(Message::NavigateUp),
                             KeyCode::Down | KeyCode::Char('j') => Some(Message::NavigateDown),
-                            KeyCode::Enter => Some(Message::ToggleConnect),
-                            KeyCode::Char('n') => Some(Message::NewEntry),
-                            KeyCode::Char('e') => Some(Message::EditEntry),
-                            KeyCode::Char('d') => Some(Message::DeleteEntry),
+                            KeyCode::Enter => {
+                                if app.demo_mode {
+                                    app.set_demo_readonly_message();
+                                    None
+                                } else {
+                                    Some(Message::ToggleConnect)
+                                }
+                            }
+                            KeyCode::Char('n') => {
+                                if app.demo_mode {
+                                    app.set_demo_readonly_message();
+                                    None
+                                } else {
+                                    Some(Message::NewEntry)
+                                }
+                            }
+                            KeyCode::Char('e') => {
+                                if app.demo_mode {
+                                    app.set_demo_readonly_message();
+                                    None
+                                } else {
+                                    Some(Message::EditEntry)
+                                }
+                            }
+                            KeyCode::Char('d') => {
+                                if app.demo_mode {
+                                    app.set_demo_readonly_message();
+                                    None
+                                } else {
+                                    Some(Message::DeleteEntry)
+                                }
+                            }
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 Some(Message::Quit)
                             }
@@ -136,7 +191,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Shutdown: terminate all active supervisors
+    // Shutdown: cancel demo tasks or terminate all active supervisors
+    if let Some(cancel) = demo_cancel {
+        cancel.cancel();
+    }
     app.shutdown();
 
     // Restore terminal

@@ -10,12 +10,12 @@ use crate::config::{
     self, Config, K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry,
     TunnelEntry, TunnelForward,
 };
-use crate::config::{SessionRecord, SessionState, load_sessions, save_sessions};
+use crate::config::{load_sessions, save_sessions, SessionRecord, SessionState};
 #[cfg(unix)]
 use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
-    ConnectionState, Supervisor, TunnelEvent, TunnelProcessType, build_kubectl_command,
-    build_ssh_command, build_sshuttle_command,
+    build_kubectl_command, build_ssh_command, build_sshuttle_command, ConnectionState, Supervisor,
+    TunnelEvent, TunnelProcessType,
 };
 
 /// How long transient status messages are shown (in seconds).
@@ -167,17 +167,30 @@ pub struct App {
     pub kubectl_warning: Option<String>,
     /// Warning message to show when sshuttle is unavailable (persisted until dismissed).
     pub sshuttle_warning: Option<String>,
+    /// Whether the app is running in demo mode (read-only, simulated tunnels).
+    pub demo_mode: bool,
 }
 
 impl App {
-    /// Create a new App from a loaded config and a tunnel event sender.
-    pub fn new(config: Config, tunnel_tx: mpsc::UnboundedSender<TunnelEvent>) -> Self {
+    /// Create a new App from a loaded config, a tunnel event sender, and a demo flag.
+    ///
+    /// When `demo_mode` is true, session loading and reconciliation are skipped
+    /// entirely — no disk I/O occurs.
+    pub fn new(
+        config: Config,
+        tunnel_tx: mpsc::UnboundedSender<TunnelEvent>,
+        demo_mode: bool,
+    ) -> Self {
         let mut connection_states = HashMap::new();
         for entry in &config.entries {
             connection_states.insert(entry.id(), ConnectionState::Disconnected);
         }
 
-        let sessions = load_sessions();
+        let sessions = if demo_mode {
+            SessionState::new()
+        } else {
+            load_sessions()
+        };
 
         let mut app = App {
             entries: config.entries,
@@ -192,9 +205,12 @@ impl App {
             mode: AppMode::Normal,
             kubectl_warning: None,
             sshuttle_warning: None,
+            demo_mode,
         };
 
-        app.reconcile_sessions();
+        if !demo_mode {
+            app.reconcile_sessions();
+        }
         app
     }
 
@@ -221,6 +237,11 @@ impl App {
     /// Set a transient status message.
     fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), Instant::now()));
+    }
+
+    /// Show a read-only warning for demo mode.
+    pub fn set_demo_readonly_message(&mut self) {
+        self.set_status("Demo mode \u{2014} read-only");
     }
 
     /// Get the connection state for an entry.
@@ -1296,11 +1317,19 @@ impl App {
         let port: u16 = form.fields[2].value.trim().parse().unwrap_or(22);
         let user = {
             let val = form.fields[3].value.trim().to_string();
-            if val.is_empty() { None } else { Some(val) }
+            if val.is_empty() {
+                None
+            } else {
+                Some(val)
+            }
         };
         let identity_file = {
             let val = form.fields[4].value.trim().to_string();
-            if val.is_empty() { None } else { Some(val) }
+            if val.is_empty() {
+                None
+            } else {
+                Some(val)
+            }
         };
         let auto_restart = form.fields[5].value.trim().eq_ignore_ascii_case("yes");
 
@@ -1350,11 +1379,19 @@ impl App {
         let name = form.fields[0].value.trim().to_string();
         let context = {
             let val = form.fields[1].value.trim().to_string();
-            if val.is_empty() { None } else { Some(val) }
+            if val.is_empty() {
+                None
+            } else {
+                Some(val)
+            }
         };
         let namespace = {
             let val = form.fields[2].value.trim().to_string();
-            if val.is_empty() { None } else { Some(val) }
+            if val.is_empty() {
+                None
+            } else {
+                Some(val)
+            }
         };
         let resource_type_str = form.fields[3].value.trim().to_lowercase();
         let resource_type = match resource_type_str.as_str() {
@@ -1426,11 +1463,19 @@ impl App {
         };
         let user = {
             let val = form.fields[4].value.trim().to_string();
-            if val.is_empty() { None } else { Some(val) }
+            if val.is_empty() {
+                None
+            } else {
+                Some(val)
+            }
         };
         let identity_file = {
             let val = form.fields[5].value.trim().to_string();
-            if val.is_empty() { None } else { Some(val) }
+            if val.is_empty() {
+                None
+            } else {
+                Some(val)
+            }
         };
         let auto_restart = form.fields[6].value.trim().eq_ignore_ascii_case("yes");
 
@@ -1649,6 +1694,19 @@ impl App {
                 }
             }
             TunnelEvent::PidUpdate { entry_id, pid } => {
+                // In demo mode, PidUpdate signals the start of a connection attempt.
+                // Transition to Connecting so the TUI shows the intermediate state.
+                if self.demo_mode {
+                    let current = self.state_of(&entry_id);
+                    if matches!(
+                        current,
+                        ConnectionState::Disconnected | ConnectionState::Failed
+                    ) {
+                        self.connection_states
+                            .insert(entry_id, ConnectionState::Connecting);
+                    }
+                }
+
                 let record = self.sessions.entry(entry_id).or_insert(SessionRecord {
                     pid: None,
                     suspended: false,
@@ -1780,7 +1838,12 @@ impl App {
     }
 
     /// Save the current entries to disk.
+    ///
+    /// In demo mode this is a no-op — config is never persisted.
     fn save_config(&self) {
+        if self.demo_mode {
+            return;
+        }
         let cfg = Config {
             entries: self.entries.clone(),
         };
@@ -1790,7 +1853,12 @@ impl App {
     }
 
     /// Persist the session state to disk.
+    ///
+    /// In demo mode this is a no-op — no session state is written.
     fn persist_sessions(&self) {
+        if self.demo_mode {
+            return;
+        }
         if let Err(e) = save_sessions(&self.sessions) {
             eprintln!("Failed to save sessions: {e}");
         }

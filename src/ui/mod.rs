@@ -4,11 +4,11 @@
 //! multi-line entry rows with color-coded state, variable-height scrolling,
 //! and modal input forms for creating/editing SSH and K8s tunnel entries.
 
-use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::Frame;
 
 use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
 use crate::config::TunnelEntry;
@@ -55,7 +55,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     ])
     .split(frame.area());
 
-    render_title_bar(frame, chunks[0]);
+    render_title_bar(frame, chunks[0], app);
     render_list_viewport(frame, chunks[1], app);
     render_status_bar(frame, chunks[2], app);
 
@@ -73,14 +73,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
 // ── Title bar ──────────────────────────────────────────────────────────
 
 /// Render the title bar with app name (left) and key hints (right).
-fn render_title_bar(frame: &mut Frame, area: Rect) {
+fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
     let style = Style::default()
         .fg(Color::White)
         .bg(COLOR_TITLE_BG)
         .add_modifier(Modifier::BOLD);
 
     let title = "STunT";
-    let hints = "[n]ew  [e]dit  [d]elete  [Enter] connect  [q]uit";
+    let hints = if app.demo_mode {
+        "[q]uit"
+    } else {
+        "[n]ew  [e]dit  [d]elete  [Enter] connect  [q]uit"
+    };
 
     let available = area.width as usize;
     let title_len = title.len();
@@ -405,7 +409,7 @@ fn render_k8s_entry_row(
 
     let mut header_spans = vec![
         Span::styled("  ", Style::default().bg(bg)),
-        Span::styled("[K8s] ", Style::default().fg(COLOR_K8S_LABEL).bg(bg)),
+        Span::styled("[K8S] ", Style::default().fg(COLOR_K8S_LABEL).bg(bg)),
         Span::styled(
             format!("{} ", entry.name),
             Style::default()
@@ -481,7 +485,10 @@ fn render_sshuttle_entry_row(
 
     let mut spans = vec![
         Span::styled("  ", Style::default().bg(bg)),
-        Span::styled("[VPN] ", Style::default().fg(COLOR_SSHUTTLE_LABEL).bg(bg)),
+        Span::styled(
+            "[sshuttle] ",
+            Style::default().fg(COLOR_SSHUTTLE_LABEL).bg(bg),
+        ),
         Span::styled(
             format!("{} ", entry.name),
             Style::default()

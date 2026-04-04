@@ -3,7 +3,7 @@
 //! Defines the unified `AppEvent` type and provides an async event reader
 //! that bridges crossterm terminal events into a tokio mpsc channel.
 
-use crossterm::event::{Event, EventStream, KeyEvent};
+use crossterm::event::{Event, EventStream, KeyEvent, KeyEventKind};
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
@@ -44,10 +44,13 @@ pub fn start_event_loop() -> (
         let mut reader = EventStream::new();
         loop {
             match reader.next().await {
-                Some(Ok(Event::Key(key))) => {
+                Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                     if app_tx_term.send(AppEvent::Key(key)).is_err() {
                         break;
                     }
+                }
+                Some(Ok(Event::Key(_))) => {
+                    // Ignore key release and repeat events (Windows emits both)
                 }
                 Some(Ok(Event::Resize(w, h))) => {
                     if app_tx_term.send(AppEvent::Resize(w, h)).is_err() {

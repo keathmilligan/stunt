@@ -1,85 +1,91 @@
 //! UI components and rendering.
 //!
-//! Implements the three-region layout (title bar, list viewport, status bar),
-//! multi-line entry rows with color-coded state, variable-height scrolling,
-//! and modal input forms for creating/editing SSH and K8s tunnel entries.
+//! Implements a three-region layout (title bar, main area, status bar) where
+//! the main area is split horizontally into a sidebar (tunnel list, 40%) and
+//! a details panel (splash / forms, 60%). On terminals narrower than
+//! `MIN_SPLIT_WIDTH` columns the details panel is omitted and the sidebar
+//! occupies the full main area.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
-use crate::config::TunnelEntry;
+use crate::config::{K8sEntry, ServerEntry, SshuttleEntry, TunnelEntry, TunnelForward};
 use crate::tunnel::ConnectionState;
 
-// ── Color palette ──────────────────────────────────────────────────────
+// ── Layout constants ────────────────────────────────────────────────────
 
-/// Color for Connected state.
+/// Minimum terminal width (columns) to show the two-panel split.
+/// Below this threshold only the sidebar is rendered.
+const MIN_SPLIT_WIDTH: u16 = 80;
+
+/// Fixed height in lines for every sidebar entry row (content only).
+const SIDEBAR_ROW_HEIGHT: u16 = 6;
+
+/// Total stride per entry including the 1-line divider that follows each row.
+const SIDEBAR_ROW_STRIDE: u16 = SIDEBAR_ROW_HEIGHT + 1;
+
+// ── Color palette ───────────────────────────────────────────────────────
+
 const COLOR_CONNECTED: Color = Color::Green;
-/// Color for Failed state.
 const COLOR_FAILED: Color = Color::Red;
-/// Color for Connecting / Reconnecting state.
 const COLOR_TRANSIENT: Color = Color::Yellow;
-/// Color for Disconnected state.
 const COLOR_DISCONNECTED: Color = Color::DarkGray;
-/// Color for Suspended state.
 const COLOR_SUSPENDED: Color = Color::Magenta;
-/// Color for forward type labels (L, R, D, K).
 const COLOR_FORWARD_LABEL: Color = Color::Cyan;
-/// Background color for the title bar.
 const COLOR_TITLE_BG: Color = Color::Blue;
-/// Background color for the status bar.
 const COLOR_STATUS_BG: Color = Color::DarkGray;
-/// Background color for the selected row.
 const COLOR_SELECTED_BG: Color = Color::Rgb(30, 40, 60);
-/// Color for K8s entry type indicator.
 const COLOR_K8S_LABEL: Color = Color::Rgb(100, 180, 255);
-/// Color for sshuttle entry type indicator.
 const COLOR_SSHUTTLE_LABEL: Color = Color::Rgb(180, 140, 255);
 
-// ── Public entry point ─────────────────────────────────────────────────
+// ── Public entry point ──────────────────────────────────────────────────
 
 /// Render the entire application UI.
-///
-/// This is the top-level `ui()` function called from the main loop.
-/// It dispatches to either the normal list view, type-select overlay, or
-/// the form overlay based on the current app mode.
 pub fn draw(frame: &mut Frame, app: &App) {
-    // Three-region layout: title bar (1), list viewport (fill), status bar (1)
-    let chunks = Layout::vertical([
+    // Three-region vertical layout: title bar (1), main area (fill), status bar (1)
+    let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
     .split(frame.area());
 
-    render_title_bar(frame, chunks[0], app);
-    render_list_viewport(frame, chunks[1], app);
-    render_status_bar(frame, chunks[2], app);
+    render_title_bar(frame, rows[0], app);
+    render_status_bar(frame, rows[2], app);
 
-    // If in type-select mode, draw the type selection overlay
-    if let AppMode::TypeSelect(ref sel) = app.mode {
-        render_type_select_overlay(frame, frame.area(), sel);
-    }
+    let main_area = rows[1];
 
-    // If in form mode, draw the modal overlay on top
-    if let AppMode::Form(ref form_state) = app.mode {
-        render_form_overlay(frame, frame.area(), form_state);
+    if main_area.width >= MIN_SPLIT_WIDTH {
+        // Two-panel split: sidebar (40%) | details panel (60%)
+        let cols = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(main_area);
+
+        let sidebar_area = cols[0];
+        let details_area = cols[1];
+
+        render_sidebar(frame, sidebar_area, app);
+        render_details_panel(frame, details_area, app);
+    } else {
+        // Narrow terminal: sidebar only
+        render_sidebar(frame, main_area, app);
     }
 }
 
-// ── Title bar ──────────────────────────────────────────────────────────
+// ── Title bar ───────────────────────────────────────────────────────────
 
-/// Render the title bar with app name (left) and key hints (right).
+/// Render the title bar with app name + version (left) and key hints (right).
 fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
     let style = Style::default()
         .fg(Color::White)
         .bg(COLOR_TITLE_BG)
         .add_modifier(Modifier::BOLD);
 
-    let title = "STunT";
+    let version = env!("CARGO_PKG_VERSION");
+    let title = format!("STunT v{version}");
     let hints = if app.demo_mode {
         "[q]uit"
     } else {
@@ -110,7 +116,7 @@ fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-// ── Status bar ─────────────────────────────────────────────────────────
+// ── Status bar ──────────────────────────────────────────────────────────
 
 /// Render the status bar with connection summary and transient messages.
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
@@ -126,7 +132,6 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         summary.push_str(&format!("  {suspended} suspended"));
     }
 
-    // Show transient message, kubectl warning, or sshuttle warning (in priority order)
     let display_msg = app
         .active_status_message()
         .map(|s| s.to_string())
@@ -163,115 +168,118 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-// ── List viewport ──────────────────────────────────────────────────────
+// ── Sidebar ─────────────────────────────────────────────────────────────
 
-/// Compute the height (in lines) of a tunnel entry row.
-fn entry_row_height(entry: &TunnelEntry) -> u16 {
-    match entry {
-        // Header line + one line per SSH forward (minimum 1 total)
-        TunnelEntry::Ssh(e) => 1 + e.forwards.len() as u16,
-        // Header line + one line per K8s port-forward binding (minimum 1 total)
-        TunnelEntry::K8s(e) => 1 + e.forwards.len() as u16,
-        // sshuttle: single header line
-        TunnelEntry::Sshuttle(_) => 1,
-    }
-    .max(1)
-}
+/// Render the sidebar: a scrollable list of fixed-height tunnel entry rows
+/// with a right-side border separating it from the details panel.
+fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
+    // Draw a block with a right border as the separator
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(Color::Rgb(50, 55, 65)));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-/// Render the scrollable list of tunnel entries.
-fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
     if app.entries.is_empty() {
-        // ASCII logo (5 lines) + blank separator + tagline + blank + hint = 9 lines total
-        let logo_lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                r"  ____  _____            _____  ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r" / ___||_   _|_   _ _ __|_   _| ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r" \___ \  | | | | | | '_ \| |   ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r"  ___) | | | | |_| | | | | |   ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                r" |____/  |_|  \__,_|_| |_|_|   ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Stupid Tunnel Tricks",
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press 'n' to create a tunnel entry.",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ];
-        let content_height = logo_lines.len() as u16;
-        let vertical_pad = area.height.saturating_sub(content_height) / 2;
-        let logo_area = Layout::vertical([
-            Constraint::Length(vertical_pad),
-            Constraint::Length(content_height),
-            Constraint::Min(0),
-        ])
-        .split(area)[1];
-        let logo = Paragraph::new(logo_lines).alignment(Alignment::Center);
-        frame.render_widget(logo, logo_area);
+        let hint = Line::from(Span::styled(
+            "No tunnels — press 'n' to add one",
+            Style::default().fg(Color::DarkGray),
+        ));
+        let y = inner.y + inner.height / 2;
+        if y < inner.y + inner.height {
+            let hint_area = Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            };
+            frame.render_widget(Paragraph::new(hint).alignment(Alignment::Center), hint_area);
+        }
         return;
     }
 
-    let viewport_height = area.height as usize;
-    let heights: Vec<usize> = app
-        .entries
-        .iter()
-        .map(|e| entry_row_height(e) as usize)
-        .collect();
+    // Reserve 1 line at the top and 1 at the bottom for scroll indicators.
+    // The list viewport sits between them.
+    if inner.height < 3 {
+        return; // too small to render anything useful
+    }
+    let indicator_top = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    let list_area = Rect {
+        x: inner.x,
+        y: inner.y + 1,
+        width: inner.width,
+        height: inner.height - 2,
+    };
+    let indicator_bot = Rect {
+        x: inner.x,
+        y: inner.y + inner.height - 1,
+        width: inner.width,
+        height: 1,
+    };
 
-    let scroll_offset =
-        compute_scroll_offset(app.selected, app.scroll_offset, &heights, viewport_height);
+    let viewport_height = list_area.height as usize;
+    let row_h = SIDEBAR_ROW_HEIGHT as usize;
+    let stride = SIDEBAR_ROW_STRIDE as usize;
+    let last_idx = app.entries.len().saturating_sub(1);
+
+    // O(1) scroll: all rows are uniform height (stride includes the divider)
+    let scroll_offset = compute_scroll_offset(
+        app.selected,
+        app.scroll_offset,
+        app.entries.len(),
+        viewport_height,
+        stride,
+    );
+
+    // Determine whether there is content above / below the viewport
+    let has_above = scroll_offset > 0;
+    let total_content_height = app.entries.len() * stride;
+    let has_below = scroll_offset + viewport_height < total_content_height;
+
+    // Scroll indicators
+    let indicator_style = Style::default().fg(Color::DarkGray);
+    if has_above {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("▲", indicator_style)))
+                .alignment(Alignment::Center),
+            indicator_top,
+        );
+    }
+    if has_below {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled("▼", indicator_style)))
+                .alignment(Alignment::Center),
+            indicator_bot,
+        );
+    }
 
     let mut y_offset: u16 = 0;
-    let mut cumulative = 0usize;
 
     for (i, entry) in app.entries.iter().enumerate() {
-        let h = heights[i];
+        let top_of_row = i * stride;
 
-        if cumulative + h <= scroll_offset {
-            cumulative += h;
+        if top_of_row + stride <= scroll_offset {
             continue;
         }
 
-        if y_offset >= area.height {
+        if y_offset >= list_area.height {
             break;
         }
 
         let is_selected = i == app.selected;
         let state = app.state_of(&entry.id());
+        let available_h = (row_h as u16).min(list_area.height - y_offset);
 
         let row_area = Rect {
-            x: area.x,
-            y: area.y + y_offset,
-            width: area.width,
-            height: (h as u16).min(area.height - y_offset),
+            x: list_area.x,
+            y: list_area.y + y_offset,
+            width: list_area.width,
+            height: available_h,
         };
 
         match entry {
@@ -282,24 +290,45 @@ fn render_list_viewport(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
 
-        y_offset += h as u16;
-        cumulative += h;
+        y_offset += row_h as u16;
+
+        // Divider between entries (not after the last one).
+        // Rendered across the full `area` width (including the border column) so
+        // the rightmost character lands on the │ border, producing a ┤ join.
+        if i < last_idx && y_offset < list_area.height {
+            let divider_area = Rect {
+                x: area.x,
+                y: list_area.y + y_offset,
+                width: area.width,
+                height: 1,
+            };
+            // inner.width dashes + the t-join that sits on the border column
+            let dashes = "─".repeat(inner.width as usize);
+            let divider = Paragraph::new(Line::from(vec![
+                Span::styled(dashes, Style::default().fg(Color::Rgb(50, 55, 65))),
+                Span::styled("┤", Style::default().fg(Color::Rgb(50, 55, 65))),
+            ]));
+            frame.render_widget(divider, divider_area);
+            y_offset += 1;
+        }
     }
 }
 
-/// Compute the adjusted scroll offset to keep the selected row fully visible.
+/// Compute the scroll offset (in lines) to keep the selected entry visible.
+/// All rows have uniform height, so this is O(1).
 fn compute_scroll_offset(
     selected: usize,
     current_offset: usize,
-    heights: &[usize],
+    entry_count: usize,
     viewport_height: usize,
+    row_h: usize,
 ) -> usize {
-    if heights.is_empty() || viewport_height == 0 {
+    if entry_count == 0 || viewport_height == 0 {
         return 0;
     }
 
-    let top_of_selected: usize = heights[..selected].iter().sum();
-    let bottom_of_selected = top_of_selected + heights[selected];
+    let top_of_selected = selected * row_h;
+    let bottom_of_selected = top_of_selected + row_h;
 
     let mut offset = current_offset;
 
@@ -314,11 +343,113 @@ fn compute_scroll_offset(
     offset
 }
 
-/// Render a single SSH server entry row.
+// ── Entry row helpers ────────────────────────────────────────────────────
+
+/// Build a content line: 1-char colored strip + 1-char blank separator + content spans.
+/// A wide trailing fill span ensures the selection background covers the full row width.
+fn entry_line<'a>(strip_color: Color, bg: Color, content: Vec<Span<'a>>) -> Line<'a> {
+    let mut spans = vec![
+        Span::styled(" ", Style::default().bg(strip_color)),
+        Span::styled(" ", Style::default().bg(bg)),
+    ];
+    spans.extend(content);
+    // Fill remaining width so the bg color covers the entire row
+    spans.push(Span::styled(" ".repeat(256), Style::default().bg(bg)));
+    Line::from(spans)
+}
+
+/// Summarise a list of SSH local/remote forwards inline if ≤2, else as count.
+/// `label` is "L", "R", or "D".
+fn ssh_forward_summary(forwards: &[&TunnelForward], label: &str) -> String {
+    match forwards.len() {
+        0 => String::new(),
+        1 => match forwards[0] {
+            TunnelForward::Local {
+                bind_port,
+                remote_host,
+                remote_port,
+                ..
+            } => {
+                format!("{label}: {bind_port}→{remote_host}:{remote_port}")
+            }
+            TunnelForward::Remote {
+                bind_port,
+                remote_host,
+                remote_port,
+                ..
+            } => {
+                format!("{label}: {bind_port}←{remote_host}:{remote_port}")
+            }
+            TunnelForward::Dynamic { bind_port, .. } => {
+                format!("{label}: {bind_port} (SOCKS)")
+            }
+        },
+        2 => {
+            let parts: Vec<String> = forwards
+                .iter()
+                .map(|f| match f {
+                    TunnelForward::Local {
+                        bind_port,
+                        remote_host,
+                        remote_port,
+                        ..
+                    } => {
+                        format!("{bind_port}→{remote_host}:{remote_port}")
+                    }
+                    TunnelForward::Remote {
+                        bind_port,
+                        remote_host,
+                        remote_port,
+                        ..
+                    } => {
+                        format!("{bind_port}←{remote_host}:{remote_port}")
+                    }
+                    TunnelForward::Dynamic { bind_port, .. } => {
+                        format!("{bind_port}(SOCKS)")
+                    }
+                })
+                .collect();
+            format!("{label}: {}", parts.join(", "))
+        }
+        n => format!("{n}{label}"),
+    }
+}
+
+/// Summarise K8s port bindings: ≤2 inline, >2 as count.
+fn k8s_bindings_summary(forwards: &[crate::config::K8sPortForward]) -> String {
+    match forwards.len() {
+        0 => String::new(),
+        1 => format!("{}→:{}", forwards[0].local_port, forwards[0].remote_port),
+        2 => format!(
+            "{}→:{}, {}→:{}",
+            forwards[0].local_port,
+            forwards[0].remote_port,
+            forwards[1].local_port,
+            forwards[1].remote_port,
+        ),
+        n => format!("{n} bindings"),
+    }
+}
+
+/// Auto-restart indicator span (or empty vec if not enabled).
+fn auto_restart_spans(auto_restart: bool, bg: Color) -> Vec<Span<'static>> {
+    if auto_restart {
+        vec![Span::styled(
+            " [R]",
+            Style::default().fg(Color::DarkGray).bg(bg),
+        )]
+    } else {
+        vec![]
+    }
+}
+
+// ── SSH entry row ────────────────────────────────────────────────────────
+
+/// Render an SSH entry row as exactly 6 lines.
 fn render_ssh_entry_row(
     frame: &mut Frame,
     area: Rect,
-    entry: &crate::config::ServerEntry,
+    entry: &ServerEntry,
     state: ConnectionState,
     is_selected: bool,
 ) {
@@ -327,12 +458,12 @@ fn render_ssh_entry_row(
     } else {
         Color::Reset
     };
+    let strip_color = state_to_color(state);
+    let state_label = format!("[{}]", state.label());
+    let w = area.width;
 
-    let state_color = state_to_color(state);
-    let state_indicator = format!("[{}]", state.label());
-
-    let mut header_spans = vec![
-        Span::styled("  ", Style::default().bg(bg)),
+    // Line 1: name, badge, state, auto-restart
+    let mut l1_content = vec![
         Span::styled("[SSH] ", Style::default().fg(Color::DarkGray).bg(bg)),
         Span::styled(
             format!("{} ", entry.name),
@@ -342,59 +473,88 @@ fn render_ssh_entry_row(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{state_indicator} "),
-            Style::default().fg(state_color).bg(bg),
-        ),
-        Span::styled(
-            format!("{}:{}", entry.host, entry.port),
-            Style::default().fg(Color::White).bg(bg),
+            format!("{state_label} "),
+            Style::default().fg(strip_color).bg(bg),
         ),
     ];
+    l1_content.extend(auto_restart_spans(entry.auto_restart, bg));
 
-    if let Some(ref user) = entry.user {
-        header_spans.push(Span::styled(
-            format!("  user:{user}"),
-            Style::default().fg(Color::DarkGray).bg(bg),
-        ));
-    }
+    // Line 2: host:port
+    let l2_content = vec![Span::styled(
+        format!("{}:{}", entry.host, entry.port),
+        Style::default().fg(Color::White).bg(bg),
+    )];
 
-    if let Some(ref id_file) = entry.identity_file {
-        header_spans.push(Span::styled(
-            format!("  key:{id_file}"),
-            Style::default().fg(Color::DarkGray).bg(bg),
-        ));
-    }
+    // Line 3: identity
+    let identity = match (&entry.user, &entry.identity_file) {
+        (Some(u), Some(k)) => format!("user:{u}  key:{k}"),
+        (Some(u), None) => format!("user:{u}"),
+        (None, Some(k)) => format!("key:{k}"),
+        (None, None) => String::new(),
+    };
+    let l3_content = vec![Span::styled(
+        identity,
+        Style::default().fg(Color::DarkGray).bg(bg),
+    )];
 
-    header_spans.push(Span::styled(
-        " ".repeat(area.width as usize),
-        Style::default().bg(bg),
-    ));
+    // Lines 4–6: forward summaries
+    let locals: Vec<&TunnelForward> = entry
+        .forwards
+        .iter()
+        .filter(|f| matches!(f, TunnelForward::Local { .. }))
+        .collect();
+    let remotes: Vec<&TunnelForward> = entry
+        .forwards
+        .iter()
+        .filter(|f| matches!(f, TunnelForward::Remote { .. }))
+        .collect();
+    let dynamics: Vec<&TunnelForward> = entry
+        .forwards
+        .iter()
+        .filter(|f| matches!(f, TunnelForward::Dynamic { .. }))
+        .collect();
 
-    let mut lines: Vec<Line> = vec![Line::from(header_spans)];
+    let l4_text = ssh_forward_summary(&locals, "L");
+    let l5_text = ssh_forward_summary(&remotes, "R");
+    let l6_text = ssh_forward_summary(&dynamics, "D");
 
-    for fwd in &entry.forwards {
-        let type_label = fwd.type_label();
-        let addr = fwd.display_address();
+    let l4_content = vec![Span::styled(
+        l4_text,
+        Style::default().fg(COLOR_FORWARD_LABEL).bg(bg),
+    )];
+    let l5_content = vec![Span::styled(
+        l5_text,
+        Style::default().fg(COLOR_FORWARD_LABEL).bg(bg),
+    )];
+    let l6_content = vec![Span::styled(
+        l6_text,
+        Style::default().fg(COLOR_FORWARD_LABEL).bg(bg),
+    )];
 
-        let fwd_line = Line::from(vec![
-            Span::styled(
-                format!("    [{type_label}] "),
-                Style::default().fg(COLOR_FORWARD_LABEL).bg(bg),
-            ),
-            Span::styled(addr, Style::default().fg(Color::White).bg(bg)),
-            Span::styled(" ".repeat(area.width as usize), Style::default().bg(bg)),
-        ]);
-        lines.push(fwd_line);
-    }
+    let lines = vec![
+        entry_line(strip_color, bg, l1_content),
+        entry_line(strip_color, bg, l2_content),
+        entry_line(strip_color, bg, l3_content),
+        entry_line(strip_color, bg, l4_content),
+        entry_line(strip_color, bg, l5_content),
+        entry_line(strip_color, bg, l6_content),
+    ];
 
-    frame.render_widget(Paragraph::new(lines), area);
+    // Only render as many lines as fit in the area
+    let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
+    // Pad to full width
+    let padded: Vec<Line> = visible.into_iter().map(|l| pad_line(l, w)).collect();
+
+    frame.render_widget(Paragraph::new(padded), area);
 }
 
-/// Render a single K8s entry row.
+// ── K8s entry row ────────────────────────────────────────────────────────
+
+/// Render a K8s entry row as exactly 6 lines.
 fn render_k8s_entry_row(
     frame: &mut Frame,
     area: Rect,
-    entry: &crate::config::K8sEntry,
+    entry: &K8sEntry,
     state: ConnectionState,
     is_selected: bool,
 ) {
@@ -403,12 +563,12 @@ fn render_k8s_entry_row(
     } else {
         Color::Reset
     };
+    let strip_color = state_to_color(state);
+    let state_label = format!("[{}]", state.label());
+    let w = area.width;
 
-    let state_color = state_to_color(state);
-    let state_indicator = format!("[{}]", state.label());
-
-    let mut header_spans = vec![
-        Span::styled("  ", Style::default().bg(bg)),
+    // Line 1
+    let mut l1_content = vec![
         Span::styled("[K8S] ", Style::default().fg(COLOR_K8S_LABEL).bg(bg)),
         Span::styled(
             format!("{} ", entry.name),
@@ -418,53 +578,64 @@ fn render_k8s_entry_row(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{state_indicator} "),
-            Style::default().fg(state_color).bg(bg),
-        ),
-        Span::styled(
-            entry.resource_identifier(),
-            Style::default().fg(COLOR_K8S_LABEL).bg(bg),
+            format!("{state_label} "),
+            Style::default().fg(strip_color).bg(bg),
         ),
     ];
+    l1_content.extend(auto_restart_spans(entry.auto_restart, bg));
 
-    if let Some(ref ctx) = entry.context {
-        header_spans.push(Span::styled(
-            format!("  ctx:{ctx}"),
-            Style::default().fg(Color::DarkGray).bg(bg),
-        ));
-    }
-    if let Some(ref ns) = entry.namespace {
-        header_spans.push(Span::styled(
-            format!("  ns:{ns}"),
-            Style::default().fg(Color::DarkGray).bg(bg),
-        ));
-    }
+    // Line 2: context
+    let ctx = entry.context.as_deref().unwrap_or("").to_string();
+    let l2_content = vec![Span::styled(
+        ctx,
+        Style::default().fg(Color::DarkGray).bg(bg),
+    )];
 
-    header_spans.push(Span::styled(
-        " ".repeat(area.width as usize),
-        Style::default().bg(bg),
-    ));
+    // Line 3: namespace
+    let ns = entry.namespace.as_deref().unwrap_or("").to_string();
+    let l3_content = vec![Span::styled(
+        ns,
+        Style::default().fg(Color::DarkGray).bg(bg),
+    )];
 
-    let mut lines: Vec<Line> = vec![Line::from(header_spans)];
+    // Line 4: resource type/name
+    let resource = entry.resource_identifier();
+    let l4_content = vec![Span::styled(
+        resource,
+        Style::default().fg(COLOR_K8S_LABEL).bg(bg),
+    )];
 
-    for fwd in &entry.forwards {
-        let addr = fwd.display_address();
-        let fwd_line = Line::from(vec![
-            Span::styled("    [K] ", Style::default().fg(COLOR_FORWARD_LABEL).bg(bg)),
-            Span::styled(addr, Style::default().fg(Color::White).bg(bg)),
-            Span::styled(" ".repeat(area.width as usize), Style::default().bg(bg)),
-        ]);
-        lines.push(fwd_line);
-    }
+    // Line 5: port-binding summary
+    let bindings = k8s_bindings_summary(&entry.forwards);
+    let l5_content = vec![Span::styled(
+        bindings,
+        Style::default().fg(COLOR_FORWARD_LABEL).bg(bg),
+    )];
 
-    frame.render_widget(Paragraph::new(lines), area);
+    // Line 6: blank
+    let l6_content: Vec<Span> = vec![];
+
+    let lines = vec![
+        entry_line(strip_color, bg, l1_content),
+        entry_line(strip_color, bg, l2_content),
+        entry_line(strip_color, bg, l3_content),
+        entry_line(strip_color, bg, l4_content),
+        entry_line(strip_color, bg, l5_content),
+        entry_line(strip_color, bg, l6_content),
+    ];
+
+    let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
+    let padded: Vec<Line> = visible.into_iter().map(|l| pad_line(l, w)).collect();
+    frame.render_widget(Paragraph::new(padded), area);
 }
 
-/// Render a single sshuttle entry row.
+// ── sshuttle entry row ───────────────────────────────────────────────────
+
+/// Render a sshuttle entry row as exactly 6 lines.
 fn render_sshuttle_entry_row(
     frame: &mut Frame,
     area: Rect,
-    entry: &crate::config::SshuttleEntry,
+    entry: &SshuttleEntry,
     state: ConnectionState,
     is_selected: bool,
 ) {
@@ -473,18 +644,12 @@ fn render_sshuttle_entry_row(
     } else {
         Color::Reset
     };
+    let strip_color = state_to_color(state);
+    let state_label = format!("[{}]", state.label());
+    let w = area.width;
 
-    let state_color = state_to_color(state);
-    let state_indicator = format!("[{}]", state.label());
-    let subnet_count = entry.subnets.len();
-    let subnet_summary = if subnet_count == 1 {
-        entry.subnets[0].clone()
-    } else {
-        format!("{subnet_count} subnets")
-    };
-
-    let mut spans = vec![
-        Span::styled("  ", Style::default().bg(bg)),
+    // Line 1
+    let mut l1_content = vec![
         Span::styled(
             "[sshuttle] ",
             Style::default().fg(COLOR_SSHUTTLE_LABEL).bg(bg),
@@ -497,142 +662,222 @@ fn render_sshuttle_entry_row(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{state_indicator} "),
-            Style::default().fg(state_color).bg(bg),
-        ),
-        Span::styled(
-            format!("{} → {}", entry.host, subnet_summary),
-            Style::default().fg(COLOR_SSHUTTLE_LABEL).bg(bg),
+            format!("{state_label} "),
+            Style::default().fg(strip_color).bg(bg),
         ),
     ];
+    l1_content.extend(auto_restart_spans(entry.auto_restart, bg));
 
-    if let Some(ref user) = entry.user {
-        spans.push(Span::styled(
-            format!("  user:{user}"),
-            Style::default().fg(Color::DarkGray).bg(bg),
-        ));
-    }
-
-    spans.push(Span::styled(
-        " ".repeat(area.width as usize),
-        Style::default().bg(bg),
-    ));
-
-    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
-}
-
-/// Map a `ConnectionState` to a display color.
-fn state_to_color(state: ConnectionState) -> Color {
-    match state {
-        ConnectionState::Connected => COLOR_CONNECTED,
-        ConnectionState::Failed => COLOR_FAILED,
-        ConnectionState::Connecting | ConnectionState::Reconnecting => COLOR_TRANSIENT,
-        ConnectionState::Disconnected => COLOR_DISCONNECTED,
-        ConnectionState::Suspended => COLOR_SUSPENDED,
-    }
-}
-
-// ── Type selection overlay ─────────────────────────────────────────────
-
-/// Render the entry type selection overlay (SSH / K8s choice).
-fn render_type_select_overlay(frame: &mut Frame, area: Rect, sel: &EntryTypeSelection) {
-    let width = 36u16.min(area.width.saturating_sub(4));
-    let height = 7u16;
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-
-    let overlay_area = Rect {
-        x,
-        y,
-        width,
-        height,
+    // Line 2: host or host:port
+    let host_str = if let Some(p) = entry.port {
+        format!("{}:{p}", entry.host)
+    } else {
+        entry.host.clone()
     };
-    frame.render_widget(Clear, overlay_area);
+    let l2_content = vec![Span::styled(
+        host_str,
+        Style::default().fg(Color::White).bg(bg),
+    )];
 
-    let block = Block::default()
-        .title(" New Entry — Select Type ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+    // Line 3: identity
+    let identity = match (&entry.user, &entry.identity_file) {
+        (Some(u), Some(k)) => format!("user:{u}  key:{k}"),
+        (Some(u), None) => format!("user:{u}"),
+        (None, Some(k)) => format!("key:{k}"),
+        (None, None) => String::new(),
+    };
+    let l3_content = vec![Span::styled(
+        identity,
+        Style::default().fg(Color::DarkGray).bg(bg),
+    )];
 
-    let inner = block.inner(overlay_area);
-    frame.render_widget(block, overlay_area);
+    // Line 4: subnet summary
+    let subnet_summary = match entry.subnets.len() {
+        0 => String::new(),
+        1 => entry.subnets[0].clone(),
+        n => format!("{n} subnets"),
+    };
+    let l4_content = vec![Span::styled(
+        subnet_summary,
+        Style::default().fg(COLOR_SSHUTTLE_LABEL).bg(bg),
+    )];
 
+    // Lines 5–6: blank
+    let blank: Vec<Span> = vec![];
+
+    let lines = vec![
+        entry_line(strip_color, bg, l1_content),
+        entry_line(strip_color, bg, l2_content),
+        entry_line(strip_color, bg, l3_content),
+        entry_line(strip_color, bg, l4_content),
+        entry_line(strip_color, bg, blank.clone()),
+        entry_line(strip_color, bg, blank),
+    ];
+
+    let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
+    let padded: Vec<Line> = visible.into_iter().map(|l| pad_line(l, w)).collect();
+    frame.render_widget(Paragraph::new(padded), area);
+}
+
+/// Return the line as-is — ratatui clips to the widget area automatically.
+fn pad_line(line: Line<'_>, _width: u16) -> Line<'_> {
+    line
+}
+
+// ── Details panel ────────────────────────────────────────────────────────
+
+/// Render the details panel: splash by default, form/type-select when active.
+fn render_details_panel(frame: &mut Frame, area: Rect, app: &App) {
+    match &app.mode {
+        AppMode::Normal => render_details_splash(frame, area, app),
+        AppMode::TypeSelect(sel) => render_type_select_overlay(frame, area, sel),
+        AppMode::Form(form_state) => render_form_overlay(frame, area, form_state),
+    }
+}
+
+/// Render the enhanced STunT splash in the details panel.
+fn render_details_splash(frame: &mut Frame, area: Rect, app: &App) {
+    let version = env!("CARGO_PKG_VERSION");
+
+    let total = app.entries.len();
+    let connected = app.count_in_state(ConnectionState::Connected);
+    let failed = app.count_in_state(ConnectionState::Failed);
+    let suspended = app.count_in_state(ConnectionState::Suspended);
+
+    let mut summary = format!("{total} entries · {connected} connected · {failed} failed");
+    if suspended > 0 {
+        summary.push_str(&format!(" · {suspended} suspended"));
+    }
+
+    let logo_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            r"  ____  _____            _____  ",
+            logo_style,
+        )),
+        Line::from(Span::styled(
+            r" / ___||_   _|_   _ _ __|_   _| ",
+            logo_style,
+        )),
+        Line::from(Span::styled(r" \___ \  | | | | | | '_ \| |   ", logo_style)),
+        Line::from(Span::styled(r"  ___) | | | | |_| | | | | |   ", logo_style)),
+        Line::from(Span::styled(r" |____/  |_|  \__,_|_| |_|_|   ", logo_style)),
+        Line::from(Span::styled(
+            format!("v{version}"),
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Stupid Tunnel Tricks",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(summary, Style::default().fg(Color::DarkGray))),
+    ];
+
+    // In Normal mode with no entries, add the hint
+    if app.entries.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Press 'n' to create a tunnel entry.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let content_height = lines.len() as u16;
+    let vertical_pad = area.height.saturating_sub(content_height) / 2;
+
+    let splash_area = Layout::vertical([
+        Constraint::Length(vertical_pad),
+        Constraint::Length(content_height),
+        Constraint::Min(0),
+    ])
+    .split(area)[1];
+
+    let splash = Paragraph::new(lines).alignment(Alignment::Center);
+    frame.render_widget(splash, splash_area);
+}
+
+// ── Type selection overlay ───────────────────────────────────────────────
+
+/// Render the entry type selection content centered within the details panel.
+fn render_type_select_overlay(frame: &mut Frame, area: Rect, sel: &EntryTypeSelection) {
     let options = ["SSH Server", "Kubernetes Workload", "sshuttle VPN"];
-    let mut lines: Vec<Line> = vec![Line::from("")];
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "New Entry — Select Type",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
     for (i, opt) in options.iter().enumerate() {
         let is_selected = i == sel.selected;
         let style = if is_selected {
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
-        let prefix = if is_selected { " > " } else { "   " };
+        let prefix = if is_selected { "> " } else { "  " };
         lines.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![Span::styled(
-        "  Tab/↑↓: select  Enter: confirm  Esc: cancel",
+    lines.push(Line::from(Span::styled(
+        "Tab/↑↓: select  Enter: confirm  Esc: cancel",
         Style::default().fg(Color::DarkGray),
-    )]));
+    )));
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    let content_height = lines.len() as u16;
+    let vertical_pad = area.height.saturating_sub(content_height) / 2;
+    let content_area = Layout::vertical([
+        Constraint::Length(vertical_pad),
+        Constraint::Length(content_height),
+        Constraint::Min(0),
+    ])
+    .split(area)[1];
+
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        content_area,
+    );
 }
 
-// ── Form overlay ───────────────────────────────────────────────────────
+// ── Form overlay ─────────────────────────────────────────────────────────
 
-/// Render the modal form overlay for creating/editing an entry.
+/// Render the form content centered within the details panel — no border or background.
 fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
     let is_edit = form.editing_id.is_some();
     let title = match (&form.entry_type, is_edit) {
-        (FormEntryType::Ssh, false) => " New SSH Entry ",
-        (FormEntryType::Ssh, true) => " Edit SSH Entry ",
-        (FormEntryType::K8s, false) => " New K8s Entry ",
-        (FormEntryType::K8s, true) => " Edit K8s Entry ",
-        (FormEntryType::Sshuttle, false) => " New sshuttle Entry ",
-        (FormEntryType::Sshuttle, true) => " Edit sshuttle Entry ",
+        (FormEntryType::Ssh, false) => "New SSH Entry",
+        (FormEntryType::Ssh, true) => "Edit SSH Entry",
+        (FormEntryType::K8s, false) => "New K8s Entry",
+        (FormEntryType::K8s, true) => "Edit K8s Entry",
+        (FormEntryType::Sshuttle, false) => "New sshuttle Entry",
+        (FormEntryType::Sshuttle, true) => "Edit sshuttle Entry",
     };
 
     let is_editing_forward = matches!(form.focus, FormFocus::ForwardEdit { .. });
 
-    let form_width = 60u16.min(area.width.saturating_sub(4));
-    let base_height = form.fields.len() as u16 + 4;
-    let forward_lines = match form.entry_type {
-        FormEntryType::Ssh => form.forwards.len() as u16,
-        FormEntryType::K8s => form.k8s_forwards.len() as u16,
-        FormEntryType::Sshuttle => 0,
-    };
-    let editing_fwd_lines = if is_editing_forward { 4 } else { 0 };
-    let form_height =
-        (base_height + forward_lines + editing_fwd_lines + 3).min(area.height.saturating_sub(2));
-
-    let form_x = area.x + (area.width.saturating_sub(form_width)) / 2;
-    let form_y = area.y + (area.height.saturating_sub(form_height)) / 2;
-
-    let form_area = Rect {
-        x: form_x,
-        y: form_y,
-        width: form_width,
-        height: form_height,
-    };
-
-    frame.render_widget(Clear, form_area);
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
-
-    let inner = block.inner(form_area);
-    frame.render_widget(block, form_area);
-
     let mut lines: Vec<Line> = Vec::new();
 
-    // Render server/entry fields
+    // Title line
+    lines.push(Line::from(Span::styled(
+        title,
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
     let server_fields_focused = matches!(form.focus, FormFocus::ServerFields);
     for (i, field) in form.fields.iter().enumerate() {
         let is_focused = server_fields_focused && i == form.focused_field;
@@ -698,11 +943,9 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         }
     }
 
-    // Blank line before forwards section (only for entry types that have forwards)
     if !matches!(form.entry_type, FormEntryType::Sshuttle) {
         lines.push(Line::from(""));
 
-        // Forwards header
         let hints = match form.focus {
             FormFocus::ForwardList => "(Enter edit  Ctrl+A add  Ctrl+D del)",
             FormFocus::ForwardEdit { .. } => "(Enter save  Esc cancel)",
@@ -723,7 +966,6 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
             Span::styled(hints, Style::default().fg(Color::DarkGray)),
         ]));
 
-        // Existing forwards
         let in_forward_list = matches!(form.focus, FormFocus::ForwardList);
         match form.entry_type {
             FormEntryType::Ssh => {
@@ -770,7 +1012,6 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         }
     }
 
-    // Forward sub-form (if editing)
     if is_editing_forward {
         let editing_label = match form.focus {
             FormFocus::ForwardEdit {
@@ -832,7 +1073,6 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         }
     }
 
-    // Blank line + hints
     lines.push(Line::from(""));
     let bottom_hints = match form.focus {
         FormFocus::ForwardEdit { .. } => "  Enter: save  Esc: cancel  Tab/Shift+Tab: fields",
@@ -844,8 +1084,41 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         Style::default().fg(Color::DarkGray),
     )]));
 
+    // Center the form content horizontally within the details panel
+    let content_width = 60u16.min(area.width);
+    let h_pad = area.width.saturating_sub(content_width) / 2;
+    let h_area = Layout::horizontal([
+        Constraint::Length(h_pad),
+        Constraint::Length(content_width),
+        Constraint::Min(0),
+    ])
+    .split(area)[1];
+
+    // Center the form content vertically within that column
+    let content_height = (lines.len() as u16).min(h_area.height);
+    let vertical_pad = h_area.height.saturating_sub(content_height) / 2;
+    let content_area = Layout::vertical([
+        Constraint::Length(vertical_pad),
+        Constraint::Length(content_height),
+        Constraint::Min(0),
+    ])
+    .split(h_area)[1];
+
     let form_content = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(form_content, inner);
+    frame.render_widget(form_content, content_area);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+
+/// Map a `ConnectionState` to a display color.
+fn state_to_color(state: ConnectionState) -> Color {
+    match state {
+        ConnectionState::Connected => COLOR_CONNECTED,
+        ConnectionState::Failed => COLOR_FAILED,
+        ConnectionState::Connecting | ConnectionState::Reconnecting => COLOR_TRANSIENT,
+        ConnectionState::Disconnected => COLOR_DISCONNECTED,
+        ConnectionState::Suspended => COLOR_SUSPENDED,
+    }
 }
 
 /// Returns (type_style, addr_style) for a forward list row, selected or not.

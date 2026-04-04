@@ -174,6 +174,71 @@ pub fn demo_entries() -> Vec<TunnelEntry> {
             subnets: vec!["192.168.50.0/24".to_string()],
             auto_restart: false,
         }),
+        // SSH: minimal — no forwards, no identity
+        TunnelEntry::Ssh(ServerEntry {
+            id: Uuid::new_v4(),
+            name: "Jump Host".to_string(),
+            host: "jump.example.com".to_string(),
+            port: 22,
+            user: Some("ops".to_string()),
+            identity_file: None,
+            forwards: vec![],
+            auto_restart: false,
+        }),
+        // K8s: Pod resource, single port binding
+        TunnelEntry::K8s(K8sEntry {
+            id: Uuid::new_v4(),
+            name: "Debug Pod".to_string(),
+            context: Some("dev".to_string()),
+            namespace: Some("debug".to_string()),
+            resource_type: K8sResourceType::Pod,
+            resource_name: "debug-shell-xyz".to_string(),
+            forwards: vec![K8sPortForward {
+                local_bind_address: "127.0.0.1".to_string(),
+                local_port: 2345,
+                remote_port: 2345,
+            }],
+            auto_restart: false,
+        }),
+        // SSH: 2 local forwards only
+        TunnelEntry::Ssh(ServerEntry {
+            id: Uuid::new_v4(),
+            name: "Analytics Cluster".to_string(),
+            host: "analytics.example.com".to_string(),
+            port: 22,
+            user: Some("analyst".to_string()),
+            identity_file: Some("~/.ssh/id_rsa".to_string()),
+            forwards: vec![
+                TunnelForward::Local {
+                    bind_address: "127.0.0.1".to_string(),
+                    bind_port: 9000,
+                    remote_host: "clickhouse.internal".to_string(),
+                    remote_port: 9000,
+                },
+                TunnelForward::Local {
+                    bind_address: "127.0.0.1".to_string(),
+                    bind_port: 9001,
+                    remote_host: "clickhouse.internal".to_string(),
+                    remote_port: 9001,
+                },
+            ],
+            auto_restart: true,
+        }),
+        // sshuttle: 3 subnets
+        TunnelEntry::Sshuttle(SshuttleEntry {
+            id: Uuid::new_v4(),
+            name: "Multi-Region VPN".to_string(),
+            host: "vpn2.example.com".to_string(),
+            port: None,
+            user: Some("netops".to_string()),
+            identity_file: Some("~/.ssh/netops_key".to_string()),
+            subnets: vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+            ],
+            auto_restart: true,
+        }),
     ]
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "stunt"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "STunT - Stupid Tunnel Tricks: A TUI for managing SSH tunnel connections"
 license = "MIT"

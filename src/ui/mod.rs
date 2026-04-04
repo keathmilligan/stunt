@@ -78,49 +78,39 @@ pub fn draw(frame: &mut Frame, app: &App) {
 // ── Title bar ───────────────────────────────────────────────────────────
 
 /// Render the title bar with app name + version (left) and key hints (right).
-fn render_title_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let style = Style::default()
+fn render_title_bar(frame: &mut Frame, area: Rect, _app: &App) {
+    let bg_style = Style::default()
         .fg(Color::White)
         .bg(COLOR_TITLE_BG)
         .add_modifier(Modifier::BOLD);
 
     let version = env!("CARGO_PKG_VERSION");
-    let title = format!("STunT v{version}");
-    let hints = if app.demo_mode {
-        "[q]uit"
-    } else {
-        "[n]ew  [e]dit  [d]elete  [Enter] connect  [q]uit"
-    };
+    let title = format!(" STunT v{version}");
+    let hints = "[n]ew  [e]dit  [d]elete  [Enter] connect  [q]uit ";
 
-    let available = area.width as usize;
-    let title_len = title.len();
-    let hints_len = hints.len();
+    // Split into left (title) and right (hints) halves.
+    // Both widgets use .style(bg_style) so the background fills every cell.
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Min(0)]).split(area);
 
-    let line = if available >= title_len + hints_len + 2 {
-        let padding = available - title_len - hints_len;
-        let pad_str: String = " ".repeat(padding);
-        Line::from(vec![
-            Span::styled(title, style),
-            Span::styled(pad_str, style),
-            Span::styled(hints, style),
-        ])
-    } else {
-        let padding = available.saturating_sub(title_len);
-        let pad_str: String = " ".repeat(padding);
-        Line::from(vec![
-            Span::styled(title, style),
-            Span::styled(pad_str, style),
-        ])
-    };
-
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::raw(title)))
+            .style(bg_style)
+            .alignment(Alignment::Left),
+        cols[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::raw(hints)))
+            .style(bg_style)
+            .alignment(Alignment::Right),
+        cols[1],
+    );
 }
 
 // ── Status bar ──────────────────────────────────────────────────────────
 
 /// Render the status bar with connection summary and transient messages.
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
-    let style = Style::default().fg(Color::White).bg(COLOR_STATUS_BG);
+    let bg_style = Style::default().fg(Color::White).bg(COLOR_STATUS_BG);
 
     let total = app.entries.len();
     let connected = app.count_in_state(ConnectionState::Connected);
@@ -138,34 +128,30 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         .or_else(|| app.kubectl_warning.as_ref().map(|w| format!("⚠ {w}")))
         .or_else(|| app.sshuttle_warning.as_ref().map(|w| format!("⚠ {w}")));
 
-    let line = if let Some(msg) = display_msg {
-        let available = area.width as usize;
-        let msg_len = msg.len();
-        let summary_len = summary.len();
-        if available >= summary_len + msg_len + 4 {
-            let padding = available - summary_len - msg_len - 2;
-            let pad_str: String = " ".repeat(padding);
-            Line::from(vec![
-                Span::styled(summary, style),
-                Span::styled(pad_str, style),
-                Span::styled(
-                    format!("{msg} "),
-                    Style::default().fg(COLOR_TRANSIENT).bg(COLOR_STATUS_BG),
-                ),
-            ])
-        } else {
-            Line::from(vec![Span::styled(summary, style)])
-        }
-    } else {
-        let padding = (area.width as usize).saturating_sub(summary.len());
-        let pad_str: String = " ".repeat(padding);
-        Line::from(vec![
-            Span::styled(summary, style),
-            Span::styled(pad_str, style),
-        ])
-    };
+    // Split into left (summary) and right (message). Both widgets carry the
+    // background style so every cell in the bar is filled even when the text
+    // is shorter than the terminal width.
+    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Min(0)]).split(area);
 
-    frame.render_widget(Paragraph::new(line), area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::raw(summary)))
+            .style(bg_style)
+            .alignment(Alignment::Left),
+        cols[0],
+    );
+
+    if let Some(msg) = display_msg {
+        let msg_style = Style::default().fg(COLOR_TRANSIENT).bg(COLOR_STATUS_BG);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(format!("{msg} "), msg_style)))
+                .style(bg_style)
+                .alignment(Alignment::Right),
+            cols[1],
+        );
+    } else {
+        // No message — render the right half as plain background fill.
+        frame.render_widget(Paragraph::new(Line::from("")).style(bg_style), cols[1]);
+    }
 }
 
 // ── Sidebar ─────────────────────────────────────────────────────────────

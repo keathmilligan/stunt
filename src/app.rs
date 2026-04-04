@@ -11,6 +11,7 @@ use crate::config::{
     TunnelEntry, TunnelForward,
 };
 use crate::config::{SessionRecord, SessionState, load_sessions, save_sessions};
+use crate::demo::DemoUiEvent;
 #[cfg(unix)]
 use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
@@ -169,6 +170,9 @@ pub struct App {
     pub sshuttle_warning: Option<String>,
     /// Whether the app is running in demo mode (read-only, simulated tunnels).
     pub demo_mode: bool,
+    /// Receiver for demo UI events (dialog open/close driven by the tour task).
+    /// `None` when not in demo mode.
+    pub demo_ui_rx: Option<mpsc::UnboundedReceiver<DemoUiEvent>>,
 }
 
 impl App {
@@ -176,10 +180,14 @@ impl App {
     ///
     /// When `demo_mode` is true, session loading and reconciliation are skipped
     /// entirely — no disk I/O occurs.
+    ///
+    /// `demo_ui_rx` should be `Some` when `demo_mode` is true; it receives
+    /// [`DemoUiEvent`] messages from the dialog tour task.
     pub fn new(
         config: Config,
         tunnel_tx: mpsc::UnboundedSender<TunnelEvent>,
         demo_mode: bool,
+        demo_ui_rx: Option<mpsc::UnboundedReceiver<DemoUiEvent>>,
     ) -> Self {
         let mut connection_states = HashMap::new();
         for entry in &config.entries {
@@ -206,6 +214,7 @@ impl App {
             kubectl_warning: None,
             sshuttle_warning: None,
             demo_mode,
+            demo_ui_rx,
         };
 
         if !demo_mode {
@@ -240,8 +249,119 @@ impl App {
     }
 
     /// Show a read-only warning for demo mode.
+    #[allow(dead_code)]
     pub fn set_demo_readonly_message(&mut self) {
         self.set_status("Demo mode \u{2014} read-only");
+    }
+
+    // ── Demo dialog tour handlers ──────────────────────────────────────────
+
+    /// Open the tunnel-type selection overlay (demo tour use only).
+    ///
+    /// Identical to the `NewEntry` message path but bypasses the read-only
+    /// guard, because the tour — not the user — is opening the dialog.
+    pub fn demo_open_type_selector(&mut self) {
+        self.mode = AppMode::TypeSelect(EntryTypeSelection { selected: 0 });
+    }
+
+    /// Advance from the type selector to a pre-populated creation form (demo tour use only).
+    ///
+    /// Picks the first fixture entry matching `entry_type` and pre-populates
+    /// the form fields from it. Falls back to the blank form if no match is
+    /// found (which should not happen with the standard fixture set).
+    pub fn demo_select_tunnel_type(&mut self, entry_type: FormEntryType) {
+        let form = match &entry_type {
+            FormEntryType::Ssh => {
+                // Find first SSH fixture and pre-populate from it.
+                if let Some(TunnelEntry::Ssh(e)) = self
+                    .entries
+                    .iter()
+                    .find(|e| matches!(e, TunnelEntry::Ssh(_)))
+                {
+                    let mut form = Self::ssh_entry_to_form(e);
+                    // Clear the editing_id so the form looks like a "new" entry.
+                    form.editing_id = None;
+                    form
+                } else {
+                    Self::new_ssh_form()
+                }
+            }
+            FormEntryType::K8s => {
+                if let Some(TunnelEntry::K8s(e)) = self
+                    .entries
+                    .iter()
+                    .find(|e| matches!(e, TunnelEntry::K8s(_)))
+                {
+                    let mut form = Self::k8s_entry_to_form(e);
+                    form.editing_id = None;
+                    form
+                } else {
+                    Self::new_k8s_form()
+                }
+            }
+            FormEntryType::Sshuttle => {
+                if let Some(TunnelEntry::Sshuttle(e)) = self
+                    .entries
+                    .iter()
+                    .find(|e| matches!(e, TunnelEntry::Sshuttle(_)))
+                {
+                    let mut form = Self::sshuttle_entry_to_form(e);
+                    form.editing_id = None;
+                    form
+                } else {
+                    Self::new_sshuttle_form()
+                }
+            }
+        };
+        self.mode = AppMode::Form(form);
+    }
+
+    /// Open the edit form for a specific demo entry (demo tour use only).
+    ///
+    /// Locates the entry by ID and opens its pre-populated edit form. If the
+    /// ID is not found, this is a no-op.
+    pub fn demo_open_edit_form(&mut self, id: Uuid) {
+        if let Some(entry) = self.entries.iter().find(|e| e.id() == id) {
+            let form = match entry {
+                TunnelEntry::Ssh(e) => Self::ssh_entry_to_form(e),
+                TunnelEntry::K8s(e) => Self::k8s_entry_to_form(e),
+                TunnelEntry::Sshuttle(e) => Self::sshuttle_entry_to_form(e),
+            };
+            self.mode = AppMode::Form(form);
+        }
+    }
+
+    /// Dismiss whatever overlay is currently open (demo tour use only).
+    ///
+    /// No-op if no overlay is active. Does NOT call `save_config` or
+    /// `persist_sessions` — demo tour dialogs are display-only.
+    pub fn demo_close_dialog(&mut self) {
+        match self.mode {
+            AppMode::TypeSelect(_) | AppMode::Form(_) => {
+                self.mode = AppMode::Normal;
+            }
+            AppMode::Normal => {
+                // Nothing to close — no-op.
+            }
+        }
+    }
+
+    /// Move the type-selector highlight to `idx` (demo tour use only).
+    ///
+    /// No-op if the app is not currently in `TypeSelect` mode.
+    pub fn demo_highlight_type(&mut self, idx: usize) {
+        if let AppMode::TypeSelect(ref mut sel) = self.mode {
+            sel.selected = idx;
+        }
+    }
+
+    /// Move the sidebar selection to `idx` (demo tour use only).
+    ///
+    /// Clamps to the valid range; no-op if entries are empty.
+    pub fn demo_select_entry(&mut self, idx: usize) {
+        if !self.entries.is_empty() {
+            self.selected = idx.min(self.entries.len() - 1);
+        }
     }
 
     /// Get the connection state for an entry.

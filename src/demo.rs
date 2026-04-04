@@ -3,6 +3,10 @@
 //! Provides hardcoded fixture entries and a per-tunnel simulation loop that
 //! emits [`TunnelEvent`] variants through the existing event channel, allowing
 //! the TUI to render realistic tunnel activity without any real processes.
+//!
+//! Also provides the dialog tour ([`start_demo_tour`]) which opens and closes
+//! the new-tunnel and edit-tunnel dialogs on a timer via a [`DemoUiEvent`]
+//! side-channel, giving a self-running showcase of all major UI surfaces.
 
 use std::time::Duration;
 
@@ -12,11 +16,46 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::app::FormEntryType;
 use crate::config::{
     K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry, TunnelEntry,
     TunnelForward,
 };
 use crate::tunnel::TunnelEvent;
+
+// ── Tour timing constants ──────────────────────────────────────────────────
+
+/// Initial splash hold before the first dialog sequence (ms).
+const TOUR_SPLASH_HOLD_MS: u64 = 4_000;
+/// How long each highlighted option is shown in the type-selector (ms).
+const TOUR_TYPE_HIGHLIGHT_MS: u64 = 1_500;
+/// How long a creation or edit form is held open before dismissal (ms).
+const TOUR_FORM_HOLD_MS: u64 = 4_000;
+/// Pause between dialog sequences — tunnel list shown unobstructed (ms).
+const TOUR_INTER_SEQUENCE_PAUSE_MS: u64 = 4_000;
+
+// ── DemoUiEvent ────────────────────────────────────────────────────────────
+
+/// Events emitted by the dialog tour task to drive UI navigation.
+///
+/// These are consumed by [`App`] before keyboard events so that the tour
+/// can open and close overlays without going through real key handlers.
+#[derive(Debug)]
+pub enum DemoUiEvent {
+    /// Open the tunnel-type selection overlay.
+    OpenTypeSelector,
+    /// Move the type-selector highlight to the given index (0=SSH, 1=K8s, 2=sshuttle).
+    HighlightType(usize),
+    /// Advance from the type selector to the creation form for the given type,
+    /// pre-populated with synthetic fixture data.
+    SelectTunnelType(FormEntryType),
+    /// Move the sidebar selection to the given entry index.
+    SelectEntry(usize),
+    /// Open the edit form for an existing demo entry (by ID).
+    OpenEditForm(Uuid),
+    /// Dismiss whatever overlay is currently open (no-op if none).
+    CloseDialog,
+}
 
 /// Returns a fixed set of synthetic tunnel entries for demo mode.
 ///
@@ -396,5 +435,168 @@ async fn cancel_sleep(duration: Duration, cancel: &CancellationToken) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => true,
         _ = tokio::time::sleep(duration) => false,
+    }
+}
+
+// ── Dialog tour ────────────────────────────────────────────────────────────
+
+/// Start the dialog tour task.
+///
+/// Spawns a tokio task that cycles through a scripted sequence of
+/// [`DemoUiEvent`] messages, opening and closing the new-tunnel type
+/// selector, creation forms, and edit forms on a timer.
+///
+/// The tour shares the same [`CancellationToken`] as the tunnel simulation
+/// tasks and stops cleanly when it is cancelled.
+pub fn start_demo_tour(
+    entries: &[TunnelEntry],
+    tx: mpsc::UnboundedSender<DemoUiEvent>,
+    cancel: CancellationToken,
+) {
+    // Collect entry IDs grouped by type for the tour cycle.
+    // We pick the first SSH, K8s, and sshuttle entry IDs for the new-tunnel
+    // sequence (one per type), and a small set for the edit sequence.
+    let ssh_id = entries.iter().find_map(|e| {
+        if let TunnelEntry::Ssh(s) = e {
+            Some(s.id)
+        } else {
+            None
+        }
+    });
+    let k8s_id = entries.iter().find_map(|e| {
+        if let TunnelEntry::K8s(k) = e {
+            Some(k.id)
+        } else {
+            None
+        }
+    });
+    let sshuttle_id = entries.iter().find_map(|e| {
+        if let TunnelEntry::Sshuttle(s) = e {
+            Some(s.id)
+        } else {
+            None
+        }
+    });
+
+    // Collect up to 3 entry IDs across types for the edit sequence.
+    let edit_ids: Vec<Uuid> = entries
+        .iter()
+        .map(|e| match e {
+            TunnelEntry::Ssh(s) => s.id,
+            TunnelEntry::K8s(k) => k.id,
+            TunnelEntry::Sshuttle(s) => s.id,
+        })
+        .take(3)
+        .collect();
+
+    tokio::spawn(async move {
+        run_demo_tour(ssh_id, k8s_id, sshuttle_id, edit_ids, tx, cancel).await;
+    });
+}
+
+/// The dialog tour loop.
+///
+/// Script per cycle:
+/// 1. Splash (3 s initial delay, 2 s between sequences)
+/// 2. New-tunnel sequence:
+///    OpenTypeSelector → animate highlight through 0/1/2 → SelectTunnelType → 2 s → CloseDialog
+///    (rotates SSH → K8s → sshuttle each cycle)
+/// 3. 2 s pause (splash visible)
+/// 4. Edit sequence:
+///    SelectEntry(i) → OpenEditForm → 2 s → CloseDialog
+///    (rotates through entries each cycle)
+/// 5. 2 s pause → repeat
+async fn run_demo_tour(
+    ssh_id: Option<Uuid>,
+    k8s_id: Option<Uuid>,
+    sshuttle_id: Option<Uuid>,
+    edit_ids: Vec<Uuid>,
+    tx: mpsc::UnboundedSender<DemoUiEvent>,
+    cancel: CancellationToken,
+) {
+    // (type_index_in_selector, FormEntryType) — rotated each new-tunnel sequence.
+    let new_types: Vec<(usize, FormEntryType)> = vec![
+        (0, FormEntryType::Ssh),
+        (1, FormEntryType::K8s),
+        (2, FormEntryType::Sshuttle),
+    ];
+
+    // Filter out types for which there is no fixture entry.
+    let new_types: Vec<(usize, FormEntryType)> = new_types
+        .into_iter()
+        .filter(|(_, t)| match t {
+            FormEntryType::Ssh => ssh_id.is_some(),
+            FormEntryType::K8s => k8s_id.is_some(),
+            FormEntryType::Sshuttle => sshuttle_id.is_some(),
+        })
+        .collect();
+
+    if new_types.is_empty() && edit_ids.is_empty() {
+        return;
+    }
+
+    let mut new_idx = 0usize;
+    let mut edit_idx = 0usize;
+
+    // Macro-ish helper: send an event, return if channel closed.
+    macro_rules! send {
+        ($event:expr) => {
+            if tx.send($event).is_err() {
+                return;
+            }
+        };
+    }
+    macro_rules! sleep {
+        ($ms:expr) => {
+            if cancel_sleep(Duration::from_millis($ms), &cancel).await {
+                return;
+            }
+        };
+    }
+
+    // Initial splash hold so tunnels have time to populate.
+    sleep!(TOUR_SPLASH_HOLD_MS);
+
+    loop {
+        // ── New-tunnel sequence ────────────────────────────────────────
+        if !new_types.is_empty() {
+            let (target_idx, entry_type) = &new_types[new_idx % new_types.len()];
+            new_idx += 1;
+
+            // Open the type selector (starts at index 0).
+            send!(DemoUiEvent::OpenTypeSelector);
+
+            // Animate: sweep through options 0 → target, pausing at each.
+            for i in 0..=*target_idx {
+                send!(DemoUiEvent::HighlightType(i));
+                sleep!(TOUR_TYPE_HIGHLIGHT_MS);
+            }
+
+            // Commit: advance to the creation form.
+            send!(DemoUiEvent::SelectTunnelType(entry_type.clone()));
+            sleep!(TOUR_FORM_HOLD_MS);
+
+            send!(DemoUiEvent::CloseDialog);
+            sleep!(TOUR_INTER_SEQUENCE_PAUSE_MS);
+        }
+
+        // ── Edit sequence ──────────────────────────────────────────────
+        if !edit_ids.is_empty() {
+            let entry_id = edit_ids[edit_idx % edit_ids.len()];
+            // The entry index in the list mirrors its position in edit_ids.
+            let entry_list_idx = edit_idx % edit_ids.len();
+            edit_idx += 1;
+
+            // Move the sidebar selection to the target entry first.
+            send!(DemoUiEvent::SelectEntry(entry_list_idx));
+            // Brief pause so the selection is visible before the form opens.
+            sleep!(400);
+
+            send!(DemoUiEvent::OpenEditForm(entry_id));
+            sleep!(TOUR_FORM_HOLD_MS);
+
+            send!(DemoUiEvent::CloseDialog);
+            sleep!(TOUR_INTER_SEQUENCE_PAUSE_MS);
+        }
     }
 }

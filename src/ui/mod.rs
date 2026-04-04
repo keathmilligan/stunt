@@ -6,11 +6,11 @@
 //! `MIN_SPLIT_WIDTH` columns the details panel is omitted and the sidebar
 //! occupies the full main area.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
 use crate::config::{K8sEntry, ServerEntry, SshuttleEntry, TunnelEntry, TunnelForward};

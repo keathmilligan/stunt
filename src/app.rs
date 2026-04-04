@@ -10,12 +10,12 @@ use crate::config::{
     self, Config, K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry,
     TunnelEntry, TunnelForward,
 };
-use crate::config::{load_sessions, save_sessions, SessionRecord, SessionState};
+use crate::config::{SessionRecord, SessionState, load_sessions, save_sessions};
 #[cfg(unix)]
 use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
-    build_kubectl_command, build_ssh_command, build_sshuttle_command, ConnectionState, Supervisor,
-    TunnelEvent, TunnelProcessType,
+    ConnectionState, Supervisor, TunnelEvent, TunnelProcessType, build_kubectl_command,
+    build_ssh_command, build_sshuttle_command,
 };
 
 /// How long transient status messages are shown (in seconds).
@@ -1317,19 +1317,11 @@ impl App {
         let port: u16 = form.fields[2].value.trim().parse().unwrap_or(22);
         let user = {
             let val = form.fields[3].value.trim().to_string();
-            if val.is_empty() {
-                None
-            } else {
-                Some(val)
-            }
+            if val.is_empty() { None } else { Some(val) }
         };
         let identity_file = {
             let val = form.fields[4].value.trim().to_string();
-            if val.is_empty() {
-                None
-            } else {
-                Some(val)
-            }
+            if val.is_empty() { None } else { Some(val) }
         };
         let auto_restart = form.fields[5].value.trim().eq_ignore_ascii_case("yes");
 
@@ -1379,19 +1371,11 @@ impl App {
         let name = form.fields[0].value.trim().to_string();
         let context = {
             let val = form.fields[1].value.trim().to_string();
-            if val.is_empty() {
-                None
-            } else {
-                Some(val)
-            }
+            if val.is_empty() { None } else { Some(val) }
         };
         let namespace = {
             let val = form.fields[2].value.trim().to_string();
-            if val.is_empty() {
-                None
-            } else {
-                Some(val)
-            }
+            if val.is_empty() { None } else { Some(val) }
         };
         let resource_type_str = form.fields[3].value.trim().to_lowercase();
         let resource_type = match resource_type_str.as_str() {
@@ -1463,19 +1447,11 @@ impl App {
         };
         let user = {
             let val = form.fields[4].value.trim().to_string();
-            if val.is_empty() {
-                None
-            } else {
-                Some(val)
-            }
+            if val.is_empty() { None } else { Some(val) }
         };
         let identity_file = {
             let val = form.fields[5].value.trim().to_string();
-            if val.is_empty() {
-                None
-            } else {
-                Some(val)
-            }
+            if val.is_empty() { None } else { Some(val) }
         };
         let auto_restart = form.fields[6].value.trim().eq_ignore_ascii_case("yes");
 

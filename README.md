@@ -23,7 +23,7 @@
 [![Install Scripts](https://packages.keathmilligan.net/stunt/badges/install-scripts.svg)](https://github.com/keathmilligan/stunt/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-https://github.com/user-attachments/assets/8f75f645-1874-47e8-ace0-2674234a8bdc
+https://github.com/user-attachments/assets/4a80c80a-18e5-4c47-aaa1-9d4930e2eb6f
 
 ## Features
 

@@ -610,8 +610,15 @@ fn render_k8s_entry_row(
         Style::default().fg(COLOR_FORWARD_LABEL).bg(bg),
     )];
 
-    // Line 6: blank
-    let l6_content: Vec<Span> = vec![];
+    // Line 6: kubeconfig path (if set)
+    let l6_content: Vec<Span> = if let Some(ref kc) = entry.kubeconfig {
+        vec![Span::styled(
+            format!("kubeconfig:{kc}"),
+            Style::default().fg(Color::DarkGray).bg(bg),
+        )]
+    } else {
+        vec![]
+    };
 
     let lines = vec![
         entry_line(strip_color, bg, l1_content),

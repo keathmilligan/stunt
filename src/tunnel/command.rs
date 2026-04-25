@@ -63,6 +63,10 @@ pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Comm
 
     cmd.arg("port-forward");
 
+    if let Some(ref kubeconfig) = entry.kubeconfig {
+        cmd.arg("--kubeconfig").arg(kubeconfig);
+    }
+
     if let Some(ref ctx) = entry.context {
         cmd.arg("--context").arg(ctx);
     }
@@ -245,9 +249,20 @@ mod tests {
         resource_type: K8sResourceType,
         resource_name: &str,
     ) -> K8sEntry {
+        make_k8s_entry_full(None, context, namespace, resource_type, resource_name)
+    }
+
+    fn make_k8s_entry_full(
+        kubeconfig: Option<&str>,
+        context: Option<&str>,
+        namespace: Option<&str>,
+        resource_type: K8sResourceType,
+        resource_name: &str,
+    ) -> K8sEntry {
         K8sEntry {
             id: Uuid::new_v4(),
             name: "test".to_string(),
+            kubeconfig: kubeconfig.map(|s| s.to_string()),
             context: context.map(|s| s.to_string()),
             namespace: namespace.map(|s| s.to_string()),
             resource_type,
@@ -309,6 +324,50 @@ mod tests {
         assert!(!args.contains(&"-n".to_string()));
         assert!(args.contains(&"service/postgres".to_string()));
         assert!(args.contains(&"127.0.0.1:5432:5432".to_string()));
+    }
+
+    #[test]
+    fn test_build_kubectl_command_with_kubeconfig() {
+        let entry = make_k8s_entry_full(
+            Some("/etc/kube/alt-config"),
+            Some("prod"),
+            Some("default"),
+            K8sResourceType::Deployment,
+            "api",
+        );
+        let fwd = make_k8s_fwd(8080, 80);
+        let cmd = build_kubectl_command(&entry, &fwd);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.contains(&"--kubeconfig".to_string()));
+        assert!(args.contains(&"/etc/kube/alt-config".to_string()));
+        assert!(args.contains(&"--context".to_string()));
+        assert!(args.contains(&"prod".to_string()));
+
+        // Ensure --kubeconfig appears before --context in the arg list
+        let kc_idx = args.iter().position(|a| a == "--kubeconfig").unwrap();
+        let ctx_idx = args.iter().position(|a| a == "--context").unwrap();
+        assert!(kc_idx < ctx_idx, "--kubeconfig should precede --context");
+    }
+
+    #[test]
+    fn test_build_kubectl_command_no_kubeconfig() {
+        let entry = make_k8s_entry(None, None, K8sResourceType::Service, "postgres");
+        let fwd = make_k8s_fwd(5432, 5432);
+        let cmd = build_kubectl_command(&entry, &fwd);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(!args.contains(&"--kubeconfig".to_string()));
     }
 
     #[test]

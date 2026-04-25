@@ -968,6 +968,10 @@ impl App {
                     value: String::new(),
                 },
                 FormField {
+                    label: "Kubeconfig".to_string(),
+                    value: String::new(),
+                },
+                FormField {
                     label: "Context".to_string(),
                     value: String::new(),
                 },
@@ -1150,6 +1154,10 @@ impl App {
                 FormField {
                     label: "Name".to_string(),
                     value: entry.name.clone(),
+                },
+                FormField {
+                    label: "Kubeconfig".to_string(),
+                    value: entry.kubeconfig.clone().unwrap_or_default(),
                 },
                 FormField {
                     label: "Context".to_string(),
@@ -1489,22 +1497,26 @@ impl App {
     /// Submit a K8s entry form.
     fn submit_k8s_form(&mut self, form: FormState) {
         let name = form.fields[0].value.trim().to_string();
-        let context = {
+        let kubeconfig = {
             let val = form.fields[1].value.trim().to_string();
             if val.is_empty() { None } else { Some(val) }
         };
-        let namespace = {
+        let context = {
             let val = form.fields[2].value.trim().to_string();
             if val.is_empty() { None } else { Some(val) }
         };
-        let resource_type_str = form.fields[3].value.trim().to_lowercase();
+        let namespace = {
+            let val = form.fields[3].value.trim().to_string();
+            if val.is_empty() { None } else { Some(val) }
+        };
+        let resource_type_str = form.fields[4].value.trim().to_lowercase();
         let resource_type = match resource_type_str.as_str() {
             "pod" => K8sResourceType::Pod,
             "service" => K8sResourceType::Service,
             _ => K8sResourceType::Deployment,
         };
-        let resource_name = form.fields[4].value.trim().to_string();
-        let auto_restart = form.fields[5].value.trim().eq_ignore_ascii_case("yes");
+        let resource_name = form.fields[5].value.trim().to_string();
+        let auto_restart = form.fields[6].value.trim().eq_ignore_ascii_case("yes");
 
         if name.is_empty() || resource_name.is_empty() {
             self.set_status("Name and Resource Name are required");
@@ -1516,6 +1528,7 @@ impl App {
                 && let TunnelEntry::K8s(k8s) = entry
             {
                 k8s.name = name;
+                k8s.kubeconfig = kubeconfig;
                 k8s.context = context;
                 k8s.namespace = namespace;
                 k8s.resource_type = resource_type;
@@ -1529,6 +1542,7 @@ impl App {
             let entry = TunnelEntry::K8s(K8sEntry {
                 id,
                 name,
+                kubeconfig,
                 context,
                 namespace,
                 resource_type,

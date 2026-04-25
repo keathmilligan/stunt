@@ -136,6 +136,7 @@ pub fn demo_entries() -> Vec<TunnelEntry> {
         TunnelEntry::K8s(K8sEntry {
             id: Uuid::new_v4(),
             name: "Staging Pods".to_string(),
+            kubeconfig: None,
             context: Some("staging".to_string()),
             namespace: Some("app".to_string()),
             resource_type: K8sResourceType::Deployment,
@@ -168,6 +169,7 @@ pub fn demo_entries() -> Vec<TunnelEntry> {
         TunnelEntry::K8s(K8sEntry {
             id: Uuid::new_v4(),
             name: "Monitoring Stack".to_string(),
+            kubeconfig: Some("~/.kube/prod-config".to_string()),
             context: Some("prod".to_string()),
             namespace: Some("monitoring".to_string()),
             resource_type: K8sResourceType::Service,
@@ -228,6 +230,7 @@ pub fn demo_entries() -> Vec<TunnelEntry> {
         TunnelEntry::K8s(K8sEntry {
             id: Uuid::new_v4(),
             name: "Debug Pod".to_string(),
+            kubeconfig: None,
             context: Some("dev".to_string()),
             namespace: Some("debug".to_string()),
             resource_type: K8sResourceType::Pod,

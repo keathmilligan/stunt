@@ -97,6 +97,10 @@ pub struct K8sEntry {
     /// Display name for this entry.
     pub name: String,
 
+    /// Path to an alternate kubeconfig file (uses default kubeconfig if omitted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig: Option<String>,
+
     /// kubeconfig context to use (uses default context if omitted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
@@ -491,6 +495,7 @@ mod tests {
         let entry = K8sEntry {
             id: Uuid::new_v4(),
             name: "api".to_string(),
+            kubeconfig: None,
             context: None,
             namespace: None,
             resource_type: K8sResourceType::Deployment,
@@ -508,6 +513,7 @@ mod tests {
             entries: vec![TunnelEntry::K8s(K8sEntry {
                 id: Uuid::new_v4(),
                 name: "postgres-debug".to_string(),
+                kubeconfig: None,
                 context: Some("prod".to_string()),
                 namespace: Some("default".to_string()),
                 resource_type: K8sResourceType::Service,
@@ -543,6 +549,7 @@ mod tests {
                 TunnelEntry::K8s(K8sEntry {
                     id: Uuid::new_v4(),
                     name: "api-debug".to_string(),
+                    kubeconfig: None,
                     context: None,
                     namespace: Some("staging".to_string()),
                     resource_type: K8sResourceType::Deployment,
@@ -584,6 +591,7 @@ mod tests {
         let k8s = TunnelEntry::K8s(K8sEntry {
             id: Uuid::new_v4(),
             name: "k8s-entry".to_string(),
+            kubeconfig: None,
             context: None,
             namespace: None,
             resource_type: K8sResourceType::Pod,
@@ -593,6 +601,65 @@ mod tests {
         });
         assert_eq!(k8s.name(), "k8s-entry");
         assert!(!k8s.auto_restart());
+    }
+
+    #[test]
+    fn test_k8s_entry_with_kubeconfig_round_trip() {
+        let config = Config {
+            entries: vec![TunnelEntry::K8s(K8sEntry {
+                id: Uuid::new_v4(),
+                name: "alt-config-test".to_string(),
+                kubeconfig: Some("~/.kube/alt-config".to_string()),
+                context: Some("staging".to_string()),
+                namespace: Some("default".to_string()),
+                resource_type: K8sResourceType::Deployment,
+                resource_name: "web".to_string(),
+                forwards: vec![K8sPortForward {
+                    local_bind_address: "127.0.0.1".to_string(),
+                    local_port: 8080,
+                    remote_port: 80,
+                }],
+                auto_restart: false,
+            })],
+        };
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("kubeconfig"));
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(config, deserialized);
+
+        let TunnelEntry::K8s(entry) = &deserialized.entries[0] else {
+            panic!("expected K8s entry");
+        };
+        assert_eq!(
+            entry.kubeconfig.as_deref(),
+            Some("~/.kube/alt-config")
+        );
+    }
+
+    #[test]
+    fn test_k8s_entry_without_kubeconfig_omits_field() {
+        let config = Config {
+            entries: vec![TunnelEntry::K8s(K8sEntry {
+                id: Uuid::new_v4(),
+                name: "no-kc".to_string(),
+                kubeconfig: None,
+                context: None,
+                namespace: None,
+                resource_type: K8sResourceType::Pod,
+                resource_name: "my-pod".to_string(),
+                forwards: vec![],
+                auto_restart: false,
+            })],
+        };
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !serialized.contains("kubeconfig"),
+            "kubeconfig should be omitted when None"
+        );
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(config, deserialized);
     }
 
     #[test]
@@ -663,6 +730,7 @@ mod tests {
                 TunnelEntry::K8s(K8sEntry {
                     id: Uuid::new_v4(),
                     name: "api-debug".to_string(),
+                    kubeconfig: None,
                     context: None,
                     namespace: None,
                     resource_type: K8sResourceType::Deployment,

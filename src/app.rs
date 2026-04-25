@@ -15,8 +15,8 @@ use crate::demo::DemoUiEvent;
 #[cfg(unix)]
 use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
-    ConnectionState, Supervisor, TunnelEvent, TunnelProcessType, build_kubectl_command,
-    build_ssh_command, build_sshuttle_command,
+    ConnectionState, LogStream, ProcessLog, Supervisor, TunnelEvent, TunnelProcessType,
+    build_kubectl_command, build_ssh_command, build_sshuttle_command,
 };
 
 /// How long transient status messages are shown (in seconds).
@@ -140,6 +140,23 @@ pub enum Message {
     FormDeleteForward,
     /// Form: cycle forward type.
     FormCycleForwardType,
+    /// Log viewer: scroll up.
+    LogScrollUp,
+    /// Log viewer: scroll down (toward bottom).
+    LogScrollDown,
+    /// Log viewer: jump to bottom (live tail).
+    LogScrollToBottom,
+}
+
+/// Per-entry process info tracked at the app level.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessInfo {
+    /// Current or last known PID.
+    pub pid: Option<u32>,
+    /// Last exit code (if the process exited normally), `None` if still running or killed.
+    pub last_exit_code: Option<Option<i32>>,
+    /// Timestamp when the process was connected (for uptime display).
+    pub connected_at: Option<Instant>,
 }
 
 /// Core application state.
@@ -173,6 +190,12 @@ pub struct App {
     /// Receiver for demo UI events (dialog open/close driven by the tour task).
     /// `None` when not in demo mode.
     pub demo_ui_rx: Option<mpsc::UnboundedReceiver<DemoUiEvent>>,
+    /// Per-entry process output logs.
+    pub process_logs: HashMap<Uuid, ProcessLog>,
+    /// Per-entry process info (PID, exit code, uptime).
+    pub process_info: HashMap<Uuid, ProcessInfo>,
+    /// Log viewer scroll offset (lines from bottom; 0 = pinned to bottom).
+    pub log_scroll_offset: usize,
 }
 
 impl App {
@@ -215,6 +238,9 @@ impl App {
             sshuttle_warning: None,
             demo_mode,
             demo_ui_rx,
+            process_logs: HashMap::new(),
+            process_info: HashMap::new(),
+            log_scroll_offset: 0,
         };
 
         if !demo_mode {
@@ -364,6 +390,21 @@ impl App {
         }
     }
 
+    /// Get the ID of the currently selected entry, if any.
+    pub fn selected_entry_id(&self) -> Option<Uuid> {
+        self.entries.get(self.selected).map(|e| e.id())
+    }
+
+    /// Get the process log for an entry.
+    pub fn log_for(&self, id: &Uuid) -> Option<&ProcessLog> {
+        self.process_logs.get(id)
+    }
+
+    /// Get the process info for an entry.
+    pub fn info_for(&self, id: &Uuid) -> Option<&ProcessInfo> {
+        self.process_info.get(id)
+    }
+
     /// Get the connection state for an entry.
     pub fn state_of(&self, id: &Uuid) -> ConnectionState {
         self.connection_states
@@ -395,11 +436,13 @@ impl App {
             Message::NavigateUp => {
                 if self.selected > 0 {
                     self.selected -= 1;
+                    self.log_scroll_offset = 0; // reset scroll on entry change
                 }
             }
             Message::NavigateDown => {
                 if !self.entries.is_empty() && self.selected < self.entries.len() - 1 {
                     self.selected += 1;
+                    self.log_scroll_offset = 0; // reset scroll on entry change
                 }
             }
             Message::NewEntry => {
@@ -465,6 +508,22 @@ impl App {
             }
             Message::TunnelEvent(event) => {
                 self.handle_tunnel_event(event);
+            }
+            Message::LogScrollUp => {
+                // Scroll up (away from bottom) by 1 line
+                if let Some(id) = self.selected_entry_id()
+                    && let Some(log) = self.process_logs.get(&id)
+                {
+                    let max_offset = log.len().saturating_sub(1);
+                    self.log_scroll_offset = (self.log_scroll_offset + 1).min(max_offset);
+                }
+            }
+            Message::LogScrollDown => {
+                // Scroll down (toward bottom) by 1 line
+                self.log_scroll_offset = self.log_scroll_offset.saturating_sub(1);
+            }
+            Message::LogScrollToBottom => {
+                self.log_scroll_offset = 0;
             }
             _ => {}
         }
@@ -1746,16 +1805,37 @@ impl App {
                 self.connection_states
                     .insert(entry_id, ConnectionState::Connected);
 
+                // Track connected_at for uptime display
+                let info = self.process_info.entry(entry_id).or_default();
+                info.connected_at = Some(Instant::now());
+                info.last_exit_code = None;
+
                 if let Some(record) = self.sessions.get_mut(&entry_id) {
                     record.connected_at = Some(Self::now_timestamp());
                 }
                 self.persist_sessions();
+
+                // Log system message
+                self.process_logs
+                    .entry(entry_id)
+                    .or_default()
+                    .push(LogStream::System, "Connected".to_string());
 
                 if let Some(entry) = self.entries.iter().find(|e| e.id() == entry_id) {
                     self.set_status(format!("Connected: {}", entry.name()));
                 }
             }
             TunnelEvent::Disconnected { entry_id } => {
+                // Clear connected_at
+                if let Some(info) = self.process_info.get_mut(&entry_id) {
+                    info.connected_at = None;
+                }
+
+                self.process_logs
+                    .entry(entry_id)
+                    .or_default()
+                    .push(LogStream::System, "Disconnected".to_string());
+
                 let auto_restart = self
                     .entries
                     .iter()
@@ -1780,6 +1860,15 @@ impl App {
                 }
             }
             TunnelEvent::Failed { entry_id, reason } => {
+                if let Some(info) = self.process_info.get_mut(&entry_id) {
+                    info.connected_at = None;
+                }
+
+                self.process_logs
+                    .entry(entry_id)
+                    .or_default()
+                    .push(LogStream::System, format!("Failed: {reason}"));
+
                 self.connection_states
                     .insert(entry_id, ConnectionState::Failed);
                 self.supervisors.remove(&entry_id);
@@ -1792,6 +1881,11 @@ impl App {
                 attempt,
                 delay_secs,
             } => {
+                self.process_logs.entry(entry_id).or_default().push(
+                    LogStream::System,
+                    format!("Reconnecting (attempt {attempt}, {delay_secs}s delay)"),
+                );
+
                 self.connection_states
                     .insert(entry_id, ConnectionState::Reconnecting);
                 if let Some(entry) = self.entries.iter().find(|e| e.id() == entry_id) {
@@ -1817,6 +1911,15 @@ impl App {
                     }
                 }
 
+                // Track PID in process info
+                let info = self.process_info.entry(entry_id).or_default();
+                info.pid = Some(pid);
+
+                self.process_logs
+                    .entry(entry_id)
+                    .or_default()
+                    .push(LogStream::System, format!("Process started (PID {pid})"));
+
                 let record = self.sessions.entry(entry_id).or_insert(SessionRecord {
                     pid: None,
                     suspended: false,
@@ -1824,6 +1927,34 @@ impl App {
                 });
                 record.pid = Some(pid);
                 self.persist_sessions();
+            }
+            TunnelEvent::Output {
+                entry_id,
+                stream,
+                text,
+            } => {
+                self.process_logs
+                    .entry(entry_id)
+                    .or_default()
+                    .push(stream, text);
+
+                // Auto-scroll: if viewing this entry and pinned to bottom, stay pinned
+                if self.selected_entry_id() == Some(entry_id) && self.log_scroll_offset == 0 {
+                    // Already at bottom — no action needed
+                }
+            }
+            TunnelEvent::ExitStatus { entry_id, code } => {
+                let info = self.process_info.entry(entry_id).or_default();
+                info.last_exit_code = Some(code);
+
+                let code_str = match code {
+                    Some(c) => format!("exit code {c}"),
+                    None => "killed by signal".to_string(),
+                };
+                self.process_logs
+                    .entry(entry_id)
+                    .or_default()
+                    .push(LogStream::System, format!("Process exited ({code_str})"));
             }
         }
     }

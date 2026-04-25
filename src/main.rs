@@ -163,6 +163,9 @@ async fn main() -> anyhow::Result<()> {
                                 KeyCode::Char('n') => Some(Message::NewEntry),
                                 KeyCode::Char('e') => Some(Message::EditEntry),
                                 KeyCode::Char('d') => Some(Message::DeleteEntry),
+                                KeyCode::PageUp => Some(Message::LogScrollUp),
+                                KeyCode::PageDown => Some(Message::LogScrollDown),
+                                KeyCode::End => Some(Message::LogScrollToBottom),
                                 KeyCode::Char('c')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {

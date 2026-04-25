@@ -2,6 +2,8 @@
 
 use uuid::Uuid;
 
+use super::output::LogStream;
+
 /// Connection state for a server entry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -62,6 +64,18 @@ pub enum TunnelEvent {
     },
     /// The supervisor spawned or respawned a process; carries the new PID.
     PidUpdate { entry_id: Uuid, pid: u32 },
+    /// A line of output captured from the tunnel process.
+    Output {
+        entry_id: Uuid,
+        stream: LogStream,
+        text: String,
+    },
+    /// The tunnel process exited with a status code (or was killed by signal).
+    ExitStatus {
+        entry_id: Uuid,
+        /// Exit code if the process exited normally, `None` if killed by signal.
+        code: Option<i32>,
+    },
 }
 
 #[cfg(test)]

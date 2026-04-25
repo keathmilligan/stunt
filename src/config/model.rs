@@ -631,10 +631,7 @@ mod tests {
         let TunnelEntry::K8s(entry) = &deserialized.entries[0] else {
             panic!("expected K8s entry");
         };
-        assert_eq!(
-            entry.kubeconfig.as_deref(),
-            Some("~/.kube/alt-config")
-        );
+        assert_eq!(entry.kubeconfig.as_deref(), Some("~/.kube/alt-config"));
     }
 
     #[test]

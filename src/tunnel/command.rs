@@ -44,9 +44,9 @@ pub fn build_ssh_command(entry: &ServerEntry) -> Command {
 
     cmd.arg(&entry.host);
 
-    // Capture all stdio so ssh doesn't interfere with the TUI
+    // Capture stdio so we can read process output in the supervisor.
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
+    cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     cmd
@@ -78,9 +78,9 @@ pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Comm
     cmd.arg(entry.resource_identifier());
     cmd.arg(forward.kubectl_arg());
 
-    // Capture all stdio so kubectl doesn't interfere with the TUI
+    // Capture stdio so we can read process output in the supervisor.
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
+    cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     cmd
@@ -118,9 +118,9 @@ pub fn build_sshuttle_command(entry: &SshuttleEntry) -> Command {
         cmd.arg(subnet);
     }
 
-    // Capture all stdio so sshuttle doesn't interfere with the TUI
+    // Capture stdio so we can read process output in the supervisor.
     cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::null());
+    cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     cmd
@@ -129,10 +129,14 @@ pub fn build_sshuttle_command(entry: &SshuttleEntry) -> Command {
 /// Spawn the given command detached in a new session.
 ///
 /// Calls `setsid()` via `pre_exec` so the process survives the TUI
-/// exiting. Returns the PID of the spawned process. The child handle is
-/// intentionally dropped — we monitor via PID polling, not `child.wait()`.
+/// exiting. Returns the child handle with stdout/stderr pipes available
+/// for reading.
+///
+/// The caller is responsible for reading from the pipes. If the TUI exits
+/// gracefully, dropping the child handle is sufficient — the process
+/// continues running in its own session.
 #[cfg(unix)]
-pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<u32> {
+pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<tokio::process::Child> {
     // Safety: setsid() is async-signal-safe and has no preconditions beyond
     // the child not already being a session leader (which a freshly forked
     // child never is).
@@ -149,15 +153,7 @@ pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<u32> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
 
-    let pid = child
-        .id()
-        .ok_or_else(|| anyhow::anyhow!("spawned process has no PID"))?;
-
-    // Intentionally drop child handle — process is detached via setsid().
-    // We track it by PID from here on.
-    drop(child);
-
-    Ok(pid)
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -491,7 +487,11 @@ mod tests {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
 
-        let pid = spawn_detached_cmd(cmd).expect("failed to spawn sleep");
+        let child = spawn_detached_cmd(cmd).expect("failed to spawn sleep");
+        let pid = child.id().expect("child has no PID");
+
+        // Drop the child handle — process should survive via setsid()
+        drop(child);
 
         // Give the OS a moment to register the process
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;

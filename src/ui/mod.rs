@@ -14,7 +14,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
 use crate::config::{K8sEntry, ServerEntry, SshuttleEntry, TunnelEntry, TunnelForward};
-use crate::tunnel::ConnectionState;
+use crate::tunnel::{ConnectionState, LogStream};
 
 // ── Layout constants ────────────────────────────────────────────────────
 
@@ -41,6 +41,12 @@ const COLOR_STATUS_BG: Color = Color::DarkGray;
 const COLOR_SELECTED_BG: Color = Color::Rgb(30, 40, 60);
 const COLOR_K8S_LABEL: Color = Color::Rgb(100, 180, 255);
 const COLOR_SSHUTTLE_LABEL: Color = Color::Rgb(180, 140, 255);
+const COLOR_LOG_TIMESTAMP: Color = Color::Rgb(100, 100, 100);
+const COLOR_LOG_STDERR: Color = Color::Rgb(255, 120, 100);
+const COLOR_LOG_SYSTEM: Color = Color::Rgb(100, 160, 255);
+const COLOR_LOG_WARNING: Color = Color::Yellow;
+const COLOR_LOG_ERROR: Color = Color::Red;
+const COLOR_LOG_DEBUG: Color = Color::Rgb(140, 140, 140);
 
 // ── Splash logo ─────────────────────────────────────────────────────────
 
@@ -98,7 +104,7 @@ fn render_title_bar(frame: &mut Frame, area: Rect, _app: &App) {
 
     let version = env!("CARGO_PKG_VERSION");
     let title = format!(" STunT v{version}");
-    let hints = "[n]ew  [e]dit  [d]elete  [Enter] connect  [q]uit ";
+    let hints = "[n]ew  [e]dit  [d]elete  [Enter] connect  PgUp/PgDn log  [q]uit ";
 
     // Split into left (title) and right (hints) halves.
     // Both widgets use .style(bg_style) so the background fills every cell.
@@ -740,20 +746,90 @@ fn render_details_panel(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-/// Render the enhanced STunT splash in the details panel.
+/// Render the details panel in Normal mode.
+///
+/// Layout (top to bottom):
+/// 1. Logo + version + subtitle (compact, top-aligned)
+/// 2. Process info section (PID, state, uptime, exit code)
+/// 3. Log viewer (fills remaining space, shows live process output)
 fn render_details_splash(frame: &mut Frame, area: Rect, app: &App) {
     let version = env!("CARGO_PKG_VERSION");
 
-    let total = app.entries.len();
-    let connected = app.count_in_state(ConnectionState::Connected);
-    let failed = app.count_in_state(ConnectionState::Failed);
-    let suspended = app.count_in_state(ConnectionState::Suspended);
-
-    let mut summary = format!("{total} entries · {connected} connected · {failed} failed");
-    if suspended > 0 {
-        summary.push_str(&format!(" · {suspended} suspended"));
+    // If no entries exist, show centered splash with hint
+    if app.entries.is_empty() {
+        render_empty_splash(frame, area, version);
+        return;
     }
 
+    let selected_id = app.selected_entry_id();
+    let selected_entry = app.entries.get(app.selected);
+
+    // Build header: logo + version + subtitle (compact)
+    let logo_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    let mut header_lines: Vec<Line> = LOGO_ART
+        .iter()
+        .map(|&row| Line::from(Span::styled(row, logo_style)))
+        .collect();
+    header_lines.push(Line::from(vec![
+        Span::styled(
+            "Stupid Tunnel Tricks",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  v{version}"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+
+    // Build process info section
+    let info_lines = if let (Some(id), Some(entry)) = (selected_id, selected_entry) {
+        build_process_info_lines(app, &id, entry)
+    } else {
+        vec![]
+    };
+
+    let header_height = header_lines.len() as u16;
+    let info_height = if info_lines.is_empty() {
+        0
+    } else {
+        info_lines.len() as u16 + 1 // +1 for separator
+    };
+
+    // Split: header | info | log viewer
+    let regions = Layout::vertical([
+        Constraint::Length(header_height),
+        Constraint::Length(info_height),
+        Constraint::Min(3), // log viewer needs at least a few lines
+    ])
+    .split(area);
+
+    // Render header
+    frame.render_widget(
+        Paragraph::new(header_lines).alignment(Alignment::Center),
+        regions[0],
+    );
+
+    // Render process info
+    if !info_lines.is_empty() {
+        let mut all_info: Vec<Line> = vec![Line::from(Span::styled(
+            "─".repeat(regions[1].width as usize),
+            Style::default().fg(Color::Rgb(50, 55, 65)),
+        ))];
+        all_info.extend(info_lines);
+        frame.render_widget(Paragraph::new(all_info), regions[1]);
+    }
+
+    // Render log viewer
+    render_log_viewer(frame, regions[2], app, selected_id);
+}
+
+/// Render an empty splash screen when no entries are configured.
+fn render_empty_splash(frame: &mut Frame, area: Rect, version: &str) {
     let logo_style = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
@@ -775,17 +851,11 @@ fn render_details_splash(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(summary, Style::default().fg(Color::DarkGray))),
-    ]);
-
-    // In Normal mode with no entries, add the hint
-    if app.entries.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        Line::from(Span::styled(
             "Press 'n' to create a tunnel entry.",
             Style::default().fg(Color::DarkGray),
-        )));
-    }
+        )),
+    ]);
 
     let content_height = lines.len() as u16;
     let vertical_pad = area.height.saturating_sub(content_height) / 2;
@@ -797,8 +867,255 @@ fn render_details_splash(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area)[1];
 
-    let splash = Paragraph::new(lines).alignment(Alignment::Center);
-    frame.render_widget(splash, splash_area);
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        splash_area,
+    );
+}
+
+/// Build the process info lines for the selected entry.
+fn build_process_info_lines<'a>(
+    app: &'a App,
+    id: &uuid::Uuid,
+    entry: &'a TunnelEntry,
+) -> Vec<Line<'a>> {
+    let state = app.state_of(id);
+    let state_color = state_to_color(state);
+    let info = app.info_for(id);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Line 1: Entry name + connection state
+    let entry_name = entry.name().to_string();
+    lines.push(Line::from(vec![
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            entry_name,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            format!("[{}]", state.label()),
+            Style::default().fg(state_color),
+        ),
+    ]));
+
+    // Line 2: PID, uptime, exit code
+    let mut detail_spans: Vec<Span> = vec![Span::styled("  ", Style::default())];
+
+    if let Some(info) = info {
+        if let Some(pid) = info.pid {
+            detail_spans.push(Span::styled(
+                format!("PID: {pid}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            detail_spans.push(Span::styled("  ", Style::default()));
+        }
+
+        if state == ConnectionState::Connected
+            && let Some(connected_at) = info.connected_at
+        {
+            let uptime = connected_at.elapsed();
+            let uptime_str = format_duration(uptime);
+            detail_spans.push(Span::styled(
+                format!("Uptime: {uptime_str}"),
+                Style::default().fg(COLOR_CONNECTED),
+            ));
+            detail_spans.push(Span::styled("  ", Style::default()));
+        }
+
+        if let Some(exit_code) = &info.last_exit_code {
+            let (code_str, code_color) = match exit_code {
+                Some(0) => ("Exit: 0".to_string(), Color::DarkGray),
+                Some(c) => (format!("Exit: {c}"), COLOR_FAILED),
+                None => ("Exit: signal".to_string(), COLOR_TRANSIENT),
+            };
+            detail_spans.push(Span::styled(code_str, Style::default().fg(code_color)));
+        }
+    }
+
+    if detail_spans.len() > 1 {
+        lines.push(Line::from(detail_spans));
+    }
+
+    lines
+}
+
+/// Format a duration as a human-readable string (e.g., "2h 15m 30s").
+fn format_duration(d: std::time::Duration) -> String {
+    let total_secs = d.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Render the log viewer panel showing live process output.
+fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App, selected_id: Option<uuid::Uuid>) {
+    // Top border
+    let border_line = Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(Color::Rgb(50, 55, 65)),
+    ));
+
+    if area.height < 2 {
+        return;
+    }
+
+    let border_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(Paragraph::new(border_line), border_area);
+
+    let log_area = Rect {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height - 1,
+    };
+
+    let log = selected_id.and_then(|id| app.log_for(&id));
+
+    if log.is_none() || log.is_some_and(|l| l.is_empty()) {
+        // Show hint
+        let hint_style = Style::default().fg(Color::Rgb(60, 60, 70));
+        let hint = if selected_id.is_some() {
+            "  No output yet — connect to see process output"
+        } else {
+            "  Select a tunnel entry"
+        };
+        if log_area.height > 0 {
+            let hint_area = Rect {
+                x: log_area.x,
+                y: log_area.y,
+                width: log_area.width,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(hint, hint_style))),
+                hint_area,
+            );
+        }
+        return;
+    }
+
+    let log = log.unwrap();
+    let viewport_height = log_area.height as usize;
+    let total_lines = log.len();
+    let scroll_offset = app.log_scroll_offset;
+
+    // Calculate which lines to show. We display from the bottom (newest) up,
+    // with scroll_offset moving the window upward.
+    let end = total_lines.saturating_sub(scroll_offset);
+    let start = end.saturating_sub(viewport_height);
+
+    let log_lines: Vec<Line> = log
+        .iter()
+        .skip(start)
+        .take(end - start)
+        .map(|log_line| colorize_log_line(log_line, log_area.width))
+        .collect();
+
+    // Show scroll indicator if not at bottom
+    let scroll_indicator = if scroll_offset > 0 {
+        format!(" [{scroll_offset} more] PgDn/End to scroll ")
+    } else {
+        String::new()
+    };
+
+    if !scroll_indicator.is_empty() && log_area.height > 1 {
+        // Show scroll indicator at bottom of log area
+        let indicator_area = Rect {
+            x: log_area.x,
+            y: log_area.y + log_area.height - 1,
+            width: log_area.width,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                scroll_indicator,
+                Style::default()
+                    .fg(COLOR_TRANSIENT)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Right),
+            indicator_area,
+        );
+
+        // Render log lines in the remaining space
+        let content_area = Rect {
+            x: log_area.x,
+            y: log_area.y,
+            width: log_area.width,
+            height: log_area.height - 1,
+        };
+        frame.render_widget(Paragraph::new(log_lines), content_area);
+    } else {
+        frame.render_widget(Paragraph::new(log_lines), log_area);
+    }
+}
+
+/// Colorize a single log line based on its stream and content.
+fn colorize_log_line(log_line: &crate::tunnel::output::LogLine, _width: u16) -> Line<'_> {
+    let ts_style = Style::default().fg(COLOR_LOG_TIMESTAMP);
+
+    let text = log_line.text.as_str();
+    let text_lower = text.to_lowercase();
+
+    // Determine the base color for the text
+    let text_style = match log_line.stream {
+        LogStream::System => Style::default().fg(COLOR_LOG_SYSTEM),
+        LogStream::Stderr => {
+            // Further classify stderr content
+            if text_lower.contains("error") || text_lower.contains("fatal") {
+                Style::default()
+                    .fg(COLOR_LOG_ERROR)
+                    .add_modifier(Modifier::BOLD)
+            } else if text_lower.contains("warn") {
+                Style::default().fg(COLOR_LOG_WARNING)
+            } else if text_lower.contains("debug") {
+                Style::default().fg(COLOR_LOG_DEBUG)
+            } else {
+                Style::default().fg(COLOR_LOG_STDERR)
+            }
+        }
+        LogStream::Stdout => {
+            // Check stdout for error/warning keywords too
+            if text_lower.contains("error") || text_lower.contains("fatal") {
+                Style::default().fg(COLOR_LOG_ERROR)
+            } else if text_lower.contains("warn") {
+                Style::default().fg(COLOR_LOG_WARNING)
+            } else if text_lower.contains("debug") {
+                Style::default().fg(COLOR_LOG_DEBUG)
+            } else {
+                Style::default().fg(Color::White)
+            }
+        }
+    };
+
+    let stream_tag = match log_line.stream {
+        LogStream::Stdout => Span::styled(" out ", Style::default().fg(Color::DarkGray)),
+        LogStream::Stderr => Span::styled(" err ", Style::default().fg(COLOR_LOG_STDERR)),
+        LogStream::System => Span::styled(" sys ", Style::default().fg(COLOR_LOG_SYSTEM)),
+    };
+
+    Line::from(vec![
+        Span::styled(format!(" {} ", log_line.timestamp), ts_style),
+        stream_tag,
+        Span::styled(text, text_style),
+    ])
 }
 
 // ── Type selection overlay ───────────────────────────────────────────────

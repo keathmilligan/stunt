@@ -42,6 +42,18 @@ const COLOR_SELECTED_BG: Color = Color::Rgb(30, 40, 60);
 const COLOR_K8S_LABEL: Color = Color::Rgb(100, 180, 255);
 const COLOR_SSHUTTLE_LABEL: Color = Color::Rgb(180, 140, 255);
 
+// ── Splash logo ─────────────────────────────────────────────────────────
+
+/// ASCII art displayed on the details-panel splash screen.
+/// Each element is one pre-spaced line; edit or re-align in place.
+const LOGO_ART: &[&str] = &[
+    r"  ____  _____           _____  ",
+    r" / ___||_   _|_   _ _ _|_   _| ",
+    r" \___ \  | | | | | | '_ \| |   ",
+    r"  ___) | | | | |_| | | | | |   ",
+    r" |____/  |_|  \__,_|_| |_|_|   ",
+];
+
 // ── Public entry point ──────────────────────────────────────────────────
 
 /// Render the entire application UI.
@@ -739,18 +751,11 @@ fn render_details_splash(frame: &mut Frame, area: Rect, app: &App) {
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            r"  ____  _____            _____  ",
-            logo_style,
-        )),
-        Line::from(Span::styled(
-            r" / ___||_   _|_   _ _ __|_   _| ",
-            logo_style,
-        )),
-        Line::from(Span::styled(r" \___ \  | | | | | | '_ \| |   ", logo_style)),
-        Line::from(Span::styled(r"  ___) | | | | |_| | | | | |   ", logo_style)),
-        Line::from(Span::styled(r" |____/  |_|  \__,_|_| |_|_|   ", logo_style)),
+    let mut lines: Vec<Line> = LOGO_ART
+        .iter()
+        .map(|&row| Line::from(Span::styled(row, logo_style)))
+        .collect();
+    lines.extend([
         Line::from(Span::styled(
             format!("v{version}"),
             Style::default().fg(Color::White),
@@ -764,7 +769,7 @@ fn render_details_splash(frame: &mut Frame, area: Rect, app: &App) {
         )),
         Line::from(""),
         Line::from(Span::styled(summary, Style::default().fg(Color::DarkGray))),
-    ];
+    ]);
 
     // In Normal mode with no entries, add the hint
     if app.entries.is_empty() {

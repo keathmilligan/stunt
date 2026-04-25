@@ -1,6 +1,6 @@
 ```
-  ____  _____            _____
- / ___||_   _|_   _ _ __|_   _|
+  ____  _____           _____
+ / ___||_   _|_   _ _ _|_   _|
  \___ \  | | | | | | '_ \| |
   ___) | | | | |_| | | | | |
  |____/  |_|  \__,_|_| |_|_|
@@ -27,90 +27,46 @@ https://github.com/user-attachments/assets/8f75f645-1874-47e8-ace0-2674234a8bdc
 
 ## Features
 
-`stunt` allows you to define tunnels with SSH, Kubernetes and `sshuttle` that persist when you close the app. 
+`stunt` allows you to define tunnels with SSH, Kubernetes and `sshuttle` that persist when you close the app. While it is running, `stunt` monitors and maintains active tunnel connections.
 
-### SSH Tunnels
-
-- Local port forwards (`ssh -L`) — expose a remote service on a local port
-- Remote port forwards (`ssh -R`) — expose a local service on a remote port
-- Dynamic SOCKS proxy (`ssh -D`) — route traffic through a remote host
-- Optional SSH username and identity file per entry
-- Custom SSH port support
-
-### Kubernetes Port-Forwards
-
-- Forward to pods, services, or deployments via `kubectl port-forward`
-- Optional kubeconfig context and namespace per entry
-- Multiple port bindings per workload entry
-
-### sshuttle VPN Sessions
-
-- Route entire subnets through a remote host via [sshuttle](https://github.com/sshuttle/sshuttle)
-- Multiple subnets per entry (comma-separated in the form)
-- Optional SSH port, username, and identity file per entry
-- Linux and macOS only (sshuttle is not supported on Windows)
-
-### Connection Management
-
-- Start and stop tunnels from a single dashboard
-- Per-entry connection state: connecting, connected, reconnecting, failed, suspended
-- Auto-reconnect with exponential backoff (up to 10 retries, max 60s delay)
-- Suspended state — manual disconnect of an auto-restart tunnel suppresses reconnection
-- Session state persisted across restarts (PIDs tracked in `sessions.json`)
-- Adopts existing tunnel processes on startup if they are still alive
-- Warning when `kubectl` or `sshuttle` is unavailable but entries of that type are configured
-
-### Configuration
-
-- Configuration stored as TOML (`tunnels.toml`) in the platform data directory
-- Atomic saves with `.bak` backup on every write
-- Automatic migration of legacy `[[server]]` format to current `[[entries]]` format
-- Multiple port-forward definitions per SSH and K8s entry
-
-### UI
-
-- Full-screen TUI built with [ratatui](https://ratatui.rs/)
-- Create and edit entries with an in-app form (no editor required)
-- Type-selection step when creating a new entry (SSH, K8s, or sshuttle)
-- In-line forward sub-form with type cycling (`Ctrl+T`)
-- Status bar with transient feedback messages
-
-## Requirements
-
-- Rust 1.85+ (2024 edition)
-- A working `ssh` client on `$PATH` (for SSH tunnels)
-- `kubectl` on `$PATH` (for Kubernetes port-forwards)
-- `sshuttle` on `$PATH` (for sshuttle VPN sessions — Linux/macOS only)
+- SSH local/remote
+- Kubernetes port-forwarding
+- sshuttle
 
 ## Installation
 
 Download the latest release for your platform from the [releases page](https://github.com/keathmilligan/stunt/releases/latest), or install via a package manager:
 
-```sh
-# Homebrew (macOS / Linux)
-brew install keathmilligan/tap/stunt
+### macOS (Homebrew)
 
-# Scoop (Windows)
-scoop bucket add keathmilligan https://github.com/keathmilligan/scoop-bucket
-scoop install stunt
-
-# apt (Debian / Ubuntu)
-# See release page for repo setup instructions
-
-# rpm (Fedora / RHEL)
-# See release page for repo setup instructions
-
-# cargo
-cargo install stunt
+```bash
+brew tap keathmilligan/tap
+brew install keathmilligan/tap/unfk
 ```
 
-## Building from Source
+Stay up-to-date with `brew upgrade unfk`.
 
-```sh
-git clone https://github.com/keathmilligan/stunt.git && cd stunt
-cargo build --release
-# Binary at: target/release/stunt
+See the [macOS Install Guide](docs/install-macos.md) for other ways to install on macOS.
+
+### Windows (PowerShell)
+
+In an elevated powershell session, run:
+
+```powershell
+irm https://packages.keathmilligan.net/unfk/install.ps1 | iex
 ```
+
+See the [Windows Install Guide](docs/install-windows.md) for other ways to install on Windows.
+
+### Linux (shell installer)
+
+```bash
+curl -fsSL https://packages.keathmilligan.net/unfk/install.sh | sh
+```
+
+This will install `unfk` into `~/.local/bin`.
+
+See the [Linux Install Guide](docs/install-linux.md) for other ways to install on Linux.
 
 ## Usage
 
@@ -207,22 +163,6 @@ port = 22                         # optional, uses sshuttle default if omitted
 user = "alice"                    # optional
 identity_file = "~/.ssh/id_ed25519"  # optional
 auto_restart = true               # optional, default false
-```
-
-## Development
-
-```sh
-# Build
-cargo build
-
-# Run tests
-cargo test
-
-# Lint
-cargo clippy -- -D warnings
-
-# Format
-cargo fmt
 ```
 
 ## License

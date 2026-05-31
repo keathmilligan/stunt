@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-tunnel-mgr is a terminal user interface (TUI) application written in Rust that allows users to define, configure, and manage SSH tunnel connections and their connection state.
+stunt is a terminal user interface (TUI) application written in Rust that allows users to define, configure, and manage SSH tunnel connections and their connection state.
 
 ## Tech Stack
 
@@ -15,7 +15,7 @@ tunnel-mgr is a terminal user interface (TUI) application written in Rust that a
 ## Project Structure
 
 ```
-tunnel-mgr/
+stunt/
 ├── src/
 │   ├── main.rs          # Entry point, CLI arg parsing, app bootstrap
 │   ├── app.rs           # Core App state and update loop

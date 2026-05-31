@@ -41,10 +41,10 @@ Download the latest release for your platform from the [releases page](https://g
 
 ```bash
 brew tap keathmilligan/tap
-brew install keathmilligan/tap/unfk
+brew install keathmilligan/tap/stunt
 ```
 
-Stay up-to-date with `brew upgrade unfk`.
+Stay up-to-date with `brew upgrade stunt`.
 
 See the [macOS Install Guide](docs/install-macos.md) for other ways to install on macOS.
 
@@ -53,7 +53,7 @@ See the [macOS Install Guide](docs/install-macos.md) for other ways to install o
 In an elevated powershell session, run:
 
 ```powershell
-irm https://packages.keathmilligan.net/unfk/install.ps1 | iex
+irm https://packages.keathmilligan.net/stunt/install.ps1 | iex
 ```
 
 See the [Windows Install Guide](docs/install-windows.md) for other ways to install on Windows.
@@ -61,10 +61,10 @@ See the [Windows Install Guide](docs/install-windows.md) for other ways to insta
 ### Linux (shell installer)
 
 ```bash
-curl -fsSL https://packages.keathmilligan.net/unfk/install.sh | sh
+curl -fsSL https://packages.keathmilligan.net/stunt/install.sh | sh
 ```
 
-This will install `unfk` into `~/.local/bin`.
+This will install `stunt` into `~/.local/bin`.
 
 See the [Linux Install Guide](docs/install-linux.md) for other ways to install on Linux.
 

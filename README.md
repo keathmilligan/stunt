@@ -106,9 +106,9 @@ Configuration is stored at:
 
 | Platform | Path |
 |----------|------|
-| Linux | `~/.local/share/tunnel-mgr/tunnels.toml` |
-| macOS | `~/Library/Application Support/tunnel-mgr/tunnels.toml` |
-| Windows | `%APPDATA%\tunnel-mgr\tunnels.toml` |
+| Linux | `~/.local/share/stunt/tunnels.toml` |
+| macOS | `~/Library/Application Support/stunt/tunnels.toml` |
+| Windows | `%APPDATA%\stunt\tunnels.toml` |
 
 ### SSH Entry
 

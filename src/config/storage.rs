@@ -7,15 +7,66 @@ use anyhow::{Context, Result};
 
 use super::model::{Config, ServerEntry, TunnelEntry};
 
+/// Application data subdirectory name within the platform data directory.
+const APP_DIR: &str = "stunt";
+
+/// Legacy application data subdirectory name (pre-rename).
+///
+/// Used only for the one-time migration of config and session files from the
+/// old `tunnel-mgr` directory to [`APP_DIR`].
+const LEGACY_APP_DIR: &str = "tunnel-mgr";
+
 /// Returns the path to the tunnel configuration file.
 ///
 /// Uses the platform user data directory via `dirs::data_dir()`:
-/// - Linux: `~/.local/share/tunnel-mgr/tunnels.toml`
-/// - macOS: `~/Library/Application Support/tunnel-mgr/tunnels.toml`
-/// - Windows: `%APPDATA%/tunnel-mgr/tunnels.toml`
+/// - Linux: `~/.local/share/stunt/tunnels.toml`
+/// - macOS: `~/Library/Application Support/stunt/tunnels.toml`
+/// - Windows: `%APPDATA%/stunt/tunnels.toml`
 pub fn config_path() -> Result<PathBuf> {
     let data_dir = dirs::data_dir().context("could not determine platform data directory")?;
-    Ok(data_dir.join("tunnel-mgr").join("tunnels.toml"))
+    Ok(data_dir.join(APP_DIR).join("tunnels.toml"))
+}
+
+/// Returns the path to the legacy (`tunnel-mgr`) tunnel configuration file.
+fn legacy_config_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().context("could not determine platform data directory")?;
+    Ok(data_dir.join(LEGACY_APP_DIR).join("tunnels.toml"))
+}
+
+/// Perform a one-time migration of the tunnel config from the legacy
+/// `tunnel-mgr` directory to the new `stunt` directory.
+///
+/// If a legacy config file exists, it is copied to `new_path` (which must not
+/// already exist). The legacy file is left in place untouched so the user can
+/// recover it if needed. Returns `Ok(true)` if a legacy file was migrated,
+/// `Ok(false)` if there was nothing to migrate.
+fn migrate_legacy_data_dir(new_path: &PathBuf) -> Result<bool> {
+    let legacy_path = match legacy_config_path() {
+        Ok(p) => p,
+        Err(_) => return Ok(false),
+    };
+
+    migrate_file(&legacy_path, new_path)
+}
+
+/// Copy `legacy_path` to `new_path` if the legacy file exists.
+///
+/// The legacy file is left in place. Returns `Ok(true)` if a file was copied,
+/// `Ok(false)` if `legacy_path` does not exist.
+fn migrate_file(legacy_path: &PathBuf, new_path: &PathBuf) -> Result<bool> {
+    if !legacy_path.exists() {
+        return Ok(false);
+    }
+
+    fs::copy(legacy_path, new_path).with_context(|| {
+        format!(
+            "failed to migrate legacy config {} -> {}",
+            legacy_path.display(),
+            new_path.display()
+        )
+    })?;
+
+    Ok(true)
 }
 
 /// Legacy config format: a flat list of `[[server]]` entries without a `type` tag.
@@ -60,17 +111,25 @@ pub fn load() -> Result<Config> {
     let path = config_path()?;
 
     if !path.exists() {
-        // First run — create directory and empty config
+        // Attempt a one-time migration from the legacy `tunnel-mgr` directory
+        // before falling back to creating a fresh, empty config.
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| {
                 format!("failed to create config directory: {}", parent.display())
             })?;
         }
-        let empty = Config::default();
-        let content = toml::to_string_pretty(&empty).context("failed to serialize empty config")?;
-        fs::write(&path, &content)
-            .with_context(|| format!("failed to write initial config: {}", path.display()))?;
-        return Ok(empty);
+
+        // If a legacy `tunnel-mgr` config was migrated, fall through to the
+        // normal load/parse path below so any legacy *format* migration also
+        // runs. Otherwise this is a genuine first run — create an empty config.
+        if !migrate_legacy_data_dir(&path)? {
+            let empty = Config::default();
+            let content =
+                toml::to_string_pretty(&empty).context("failed to serialize empty config")?;
+            fs::write(&path, &content)
+                .with_context(|| format!("failed to write initial config: {}", path.display()))?;
+            return Ok(empty);
+        }
     }
 
     let content = fs::read_to_string(&path)
@@ -141,13 +200,13 @@ mod tests {
     #[test]
     fn test_config_path_is_valid() {
         let path = config_path().unwrap();
-        assert!(path.to_string_lossy().contains("tunnel-mgr"));
+        assert!(path.to_string_lossy().contains("stunt"));
         assert!(path.to_string_lossy().ends_with("tunnels.toml"));
     }
 
     #[test]
     fn test_save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("tunnel-mgr-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stunt-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tunnels.toml");
 
@@ -182,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_save_creates_backup() {
-        let dir = std::env::temp_dir().join(format!("tunnel-mgr-test-bak-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stunt-test-bak-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tunnels.toml");
         let bak_path = dir.join("tunnels.toml.bak");
@@ -275,5 +334,41 @@ auto_restart = true
         // should also handle it gracefully
         let migrated = migrate_legacy_config(legacy_toml).unwrap();
         assert!(migrated.entries.is_empty());
+    }
+
+    #[test]
+    fn test_migrate_file_copies_legacy() {
+        let base = std::env::temp_dir().join(format!("stunt-migrate-{}", Uuid::new_v4()));
+        let legacy_dir = base.join("tunnel-mgr");
+        let new_dir = base.join("stunt");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::create_dir_all(&new_dir).unwrap();
+
+        let legacy_path = legacy_dir.join("tunnels.toml");
+        let new_path = new_dir.join("tunnels.toml");
+        fs::write(&legacy_path, "# legacy contents").unwrap();
+
+        let migrated = migrate_file(&legacy_path, &new_path).unwrap();
+        assert!(migrated, "should report a migration occurred");
+        assert_eq!(fs::read_to_string(&new_path).unwrap(), "# legacy contents");
+        // Legacy file is preserved.
+        assert!(legacy_path.exists());
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn test_migrate_file_no_legacy_is_noop() {
+        let base = std::env::temp_dir().join(format!("stunt-migrate-none-{}", Uuid::new_v4()));
+        fs::create_dir_all(&base).unwrap();
+
+        let legacy_path = base.join("tunnel-mgr").join("tunnels.toml");
+        let new_path = base.join("stunt").join("tunnels.toml");
+
+        let migrated = migrate_file(&legacy_path, &new_path).unwrap();
+        assert!(!migrated, "no legacy file means no migration");
+        assert!(!new_path.exists());
+
+        fs::remove_dir_all(&base).ok();
     }
 }

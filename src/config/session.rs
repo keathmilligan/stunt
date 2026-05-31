@@ -26,14 +26,65 @@ pub struct SessionRecord {
 /// Runtime session state: maps tunnel UUIDs to their session records.
 pub type SessionState = HashMap<Uuid, SessionRecord>;
 
+/// Application data subdirectory name within the platform data directory.
+const APP_DIR: &str = "stunt";
+
+/// Legacy application data subdirectory name (pre-rename).
+///
+/// Used only for the one-time migration of the session file from the old
+/// `tunnel-mgr` directory to [`APP_DIR`].
+const LEGACY_APP_DIR: &str = "tunnel-mgr";
+
 /// Returns the path to the session state file.
 ///
 /// Uses the platform user data directory via `dirs::data_dir()`:
-/// - Linux: `~/.local/share/tunnel-mgr/sessions.json`
-/// - macOS: `~/Library/Application Support/tunnel-mgr/sessions.json`
+/// - Linux: `~/.local/share/stunt/sessions.json`
+/// - macOS: `~/Library/Application Support/stunt/sessions.json`
+/// - Windows: `%APPDATA%/stunt/sessions.json`
 pub fn session_path() -> Result<PathBuf> {
     let data_dir = dirs::data_dir().context("could not determine platform data directory")?;
-    Ok(data_dir.join("tunnel-mgr").join("sessions.json"))
+    Ok(data_dir.join(APP_DIR).join("sessions.json"))
+}
+
+/// Returns the path to the legacy (`tunnel-mgr`) session state file.
+fn legacy_session_path() -> Result<PathBuf> {
+    let data_dir = dirs::data_dir().context("could not determine platform data directory")?;
+    Ok(data_dir.join(LEGACY_APP_DIR).join("sessions.json"))
+}
+
+/// Perform a one-time migration of the session file from the legacy
+/// `tunnel-mgr` directory to the new `stunt` directory.
+///
+/// If a legacy session file exists, it is copied to `new_path` (which must not
+/// already exist). The legacy file is left in place untouched. Failures are
+/// logged as warnings and ignored, since session state is non-critical.
+fn migrate_legacy_session(new_path: &PathBuf) {
+    let legacy_path = match legacy_session_path() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    if !legacy_path.exists() {
+        return;
+    }
+
+    if let Some(parent) = new_path.parent()
+        && let Err(e) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "warning: failed to create session directory {}: {e}",
+            parent.display()
+        );
+        return;
+    }
+
+    if let Err(e) = fs::copy(&legacy_path, new_path) {
+        eprintln!(
+            "warning: failed to migrate legacy session file {} -> {}: {e}",
+            legacy_path.display(),
+            new_path.display()
+        );
+    }
 }
 
 /// Load session state from disk.
@@ -47,7 +98,12 @@ pub fn load_sessions() -> SessionState {
     };
 
     if !path.exists() {
-        return SessionState::new();
+        // Attempt a one-time migration from the legacy `tunnel-mgr` directory.
+        migrate_legacy_session(&path);
+
+        if !path.exists() {
+            return SessionState::new();
+        }
     }
 
     let content = match fs::read_to_string(&path) {
@@ -153,7 +209,7 @@ mod tests {
 
     #[test]
     fn test_save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("tunnel-mgr-session-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stunt-session-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
 
@@ -182,8 +238,7 @@ mod tests {
 
     #[test]
     fn test_corrupt_json_returns_empty() {
-        let dir =
-            std::env::temp_dir().join(format!("tunnel-mgr-session-corrupt-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("stunt-session-corrupt-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sessions.json");
 

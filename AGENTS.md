@@ -47,7 +47,7 @@ stunt/
   - Input events produce messages that drive state transitions.
   - The `ui/` module renders the current state; it never mutates state directly.
 - Tunnel processes are managed asynchronously via tokio tasks.
-- Configuration is stored as TOML files in a user-configurable directory (default: `~/.config/tunnel-mgr/`).
+- Configuration is stored as TOML files in the platform user data directory (default: `~/.local/share/stunt/`).
 
 ### Testing
 

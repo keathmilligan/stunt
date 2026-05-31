@@ -42,15 +42,14 @@ jobs:
         x86_64-unknown-linux-musl,
         aarch64-unknown-linux-musl
       tap-repo: keathmilligan/homebrew-tap
-      bucket-repo: keathmilligan/scoop-bucket
       packages-repo: keathmilligan/packages
       enable-cargo: true
       cargo-alt-name: stunt-tunnels
       enable-install-scripts: true
       enable-homebrew: true
-      enable-scoop: true
+      enable-scoop: false
       enable-chocolatey: false
-      enable-winget: false
+      enable-winget: true
       enable-apt: true
       enable-rpm: true
       enable-apk: false

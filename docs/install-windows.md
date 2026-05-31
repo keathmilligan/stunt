@@ -16,13 +16,6 @@ If you have Rust development tools installed you can install with `cargo`:
 cargo install unfk
 ```
 
-## Scoop (Windows)
-
-```powershell
-scoop bucket add keathmilligan https://github.com/keathmilligan/scoop-bucket
-scoop install unfk
-```
-
 ## Windows MSI
 
 Download the signed `.msi` installer directly from the [GitHub Releases](https://github.com/keathmilligan/unfk/releases) page.

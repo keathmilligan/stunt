@@ -12,7 +12,7 @@ pub use pid::TunnelProcessType;
 #[cfg(unix)]
 pub use pid::is_live_tunnel;
 pub use state::{ConnectionState, TunnelEvent};
-pub use supervisor::Supervisor;
+pub use supervisor::{ReadinessProbe, Supervisor};
 
 /// Check that the `ssh` binary is available on PATH.
 ///

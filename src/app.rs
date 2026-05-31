@@ -15,8 +15,8 @@ use crate::demo::DemoUiEvent;
 #[cfg(unix)]
 use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
-    ConnectionState, LogStream, ProcessLog, Supervisor, TunnelEvent, TunnelProcessType,
-    build_kubectl_command, build_ssh_command, build_sshuttle_command,
+    ConnectionState, LogStream, ProcessLog, ReadinessProbe, Supervisor, TunnelEvent,
+    TunnelProcessType, build_kubectl_command, build_ssh_command, build_sshuttle_command,
 };
 
 /// How long transient status messages are shown (in seconds).
@@ -1708,12 +1708,14 @@ impl App {
 
         let supervisor = match &entry {
             TunnelEntry::Ssh(ssh_entry) => {
+                let probe = ssh_readiness_probe(ssh_entry);
                 let ssh_entry = ssh_entry.clone();
                 Supervisor::spawn(
                     id,
                     ssh_entry.auto_restart,
                     TunnelProcessType::Ssh,
                     Box::new(move || build_ssh_command(&ssh_entry)),
+                    probe,
                     self.tunnel_tx.clone(),
                 )
             }
@@ -1731,22 +1733,28 @@ impl App {
                 // Spawn for the first forward only; additional forwards would need
                 // separate supervisor tracking — deferred to future multi-forward support.
                 let forward = k8s_entry.forwards[0].clone();
+                let (probe_addr, probe_port) = forward.local_listen_target();
+                let probe = Some(ReadinessProbe::new(probe_addr, probe_port));
                 let k8s_entry = k8s_entry.clone();
                 Supervisor::spawn(
                     id,
                     k8s_entry.auto_restart,
                     TunnelProcessType::Kubectl,
                     Box::new(move || build_kubectl_command(&k8s_entry, &forward)),
+                    probe,
                     self.tunnel_tx.clone(),
                 )
             }
             TunnelEntry::Sshuttle(sshuttle_entry) => {
+                // sshuttle has no simple local listener to probe; fall back to
+                // the supervisor's stability-threshold heuristic.
                 let sshuttle_entry = sshuttle_entry.clone();
                 Supervisor::spawn(
                     id,
                     sshuttle_entry.auto_restart,
                     TunnelProcessType::Sshuttle,
                     Box::new(move || build_sshuttle_command(&sshuttle_entry)),
+                    None,
                     self.tunnel_tx.clone(),
                 )
             }
@@ -2000,9 +2008,12 @@ impl App {
             if let Some(pid) = record.pid
                 && is_live_tunnel(pid, _process_type)
             {
-                // PID alive — adopt it
+                // PID alive — adopt it. Show "connecting" until the supervisor's
+                // stability check confirms the tunnel and emits a Connected event;
+                // a live PID alone does not mean the tunnel is established (e.g. the
+                // ssh process may still be negotiating or about to time out).
                 self.connection_states
-                    .insert(id, ConnectionState::Connected);
+                    .insert(id, ConnectionState::Connecting);
                 let entry = match self.entries.iter().find(|e| e.id() == id) {
                     Some(e) => e.clone(),
                     None => continue,
@@ -2011,6 +2022,7 @@ impl App {
 
                 let supervisor = match &entry {
                     TunnelEntry::Ssh(ssh) => {
+                        let probe = ssh_readiness_probe(ssh);
                         let ssh = ssh.clone();
                         Supervisor::adopt(
                             id,
@@ -2018,6 +2030,7 @@ impl App {
                             auto_restart,
                             TunnelProcessType::Ssh,
                             Box::new(move || build_ssh_command(&ssh)),
+                            probe,
                             self.tunnel_tx.clone(),
                         )
                     }
@@ -2026,6 +2039,8 @@ impl App {
                             continue;
                         }
                         let forward = k8s.forwards[0].clone();
+                        let (probe_addr, probe_port) = forward.local_listen_target();
+                        let probe = Some(ReadinessProbe::new(probe_addr, probe_port));
                         let k8s = k8s.clone();
                         Supervisor::adopt(
                             id,
@@ -2033,6 +2048,7 @@ impl App {
                             auto_restart,
                             TunnelProcessType::Kubectl,
                             Box::new(move || build_kubectl_command(&k8s, &forward)),
+                            probe,
                             self.tunnel_tx.clone(),
                         )
                     }
@@ -2044,6 +2060,7 @@ impl App {
                             auto_restart,
                             TunnelProcessType::Sshuttle,
                             Box::new(move || build_sshuttle_command(&sshuttle)),
+                            None,
                             self.tunnel_tx.clone(),
                         )
                     }
@@ -2119,4 +2136,19 @@ impl App {
             supervisor.cancel();
         }
     }
+}
+
+/// Derive a readiness probe for an SSH entry from its first probeable forward.
+///
+/// Returns the local listener of the first `-L` (local) or `-D` (dynamic)
+/// forward, which only starts accepting connections once the SSH session is
+/// established. Entries with only `-R` (remote) forwards expose no local
+/// listener, so `None` is returned and the supervisor falls back to its
+/// stability-threshold heuristic.
+fn ssh_readiness_probe(entry: &ServerEntry) -> Option<ReadinessProbe> {
+    entry
+        .forwards
+        .iter()
+        .find_map(|fwd| fwd.local_listen_target())
+        .map(|(addr, port)| ReadinessProbe::new(addr, port))
 }

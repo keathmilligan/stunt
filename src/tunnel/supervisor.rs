@@ -35,9 +35,25 @@ use super::state::TunnelEvent;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Stability threshold — how long the process must run before we consider
-/// it "connected".
+/// it "connected" when no readiness probe is available (e.g. remote-only
+/// forwards). Probe-capable tunnels confirm readiness by connecting to the
+/// local listener instead of relying on this timer.
 #[cfg(unix)]
 const STABILITY_THRESHOLD: Duration = Duration::from_secs(3);
+
+/// How often to attempt a readiness probe against the local listener while
+/// waiting for the tunnel to come up.
+#[cfg(unix)]
+const PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Maximum time to wait for a readiness probe to succeed before giving up and
+/// treating the connection attempt as failed.
+#[cfg(unix)]
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-attempt TCP connect timeout for a single readiness probe.
+#[cfg(unix)]
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum reconnect attempts before marking as failed.
 #[cfg(unix)]
@@ -53,6 +69,31 @@ const BASE_BACKOFF_SECS: u64 = 1;
 
 /// A factory function that builds a fresh `Command` for reconnection attempts.
 type CommandFactory = Box<dyn Fn() -> Command + Send + 'static>;
+
+/// A target for confirming that a tunnel is actually serving traffic.
+///
+/// For tunnels that bind a local listener (`ssh -L`/`-D`, `kubectl
+/// port-forward`), the listener only starts accepting connections once the
+/// underlying session is authenticated and the forward is established. A
+/// successful TCP connect to this address is therefore strong evidence that
+/// the tunnel is ready — much stronger than the process merely being alive.
+#[derive(Debug, Clone)]
+pub struct ReadinessProbe {
+    /// Local address the tunnel listens on (e.g. "127.0.0.1").
+    pub address: String,
+    /// Local port the tunnel listens on.
+    pub port: u16,
+}
+
+impl ReadinessProbe {
+    /// Create a new readiness probe for a local listener.
+    pub fn new(address: impl Into<String>, port: u16) -> Self {
+        ReadinessProbe {
+            address: address.into(),
+            port,
+        }
+    }
+}
 
 /// Manages the lifecycle of a tunnel connection (SSH, kubectl, or sshuttle).
 pub struct Supervisor {
@@ -73,8 +114,9 @@ impl Supervisor {
     /// 1. Spawn a detached process via the provided `command_factory`
     /// 2. Send `PidUpdate` with the new PID
     /// 3. Start capturing stdout/stderr, forwarding lines as `TunnelEvent::Output`
-    /// 4. Wait for the stability threshold
-    /// 5. Send `Connected` if stable
+    /// 4. Wait until the tunnel is confirmed ready (via `probe` if present,
+    ///    otherwise via the stability threshold)
+    /// 5. Send `Connected` once ready
     /// 6. Wait for process exit; on death, reconnect with backoff if `auto_restart`
     /// 7. Send `Failed` after max retries
     pub fn spawn(
@@ -82,6 +124,7 @@ impl Supervisor {
         auto_restart: bool,
         _process_type: TunnelProcessType,
         command_factory: CommandFactory,
+        probe: Option<ReadinessProbe>,
         tx: mpsc::UnboundedSender<TunnelEvent>,
     ) -> Self {
         let cancel = CancellationToken::new();
@@ -97,6 +140,7 @@ impl Supervisor {
                 entry_id,
                 auto_restart,
                 command_factory,
+                probe,
                 tx,
                 cancel_clone,
                 pid_clone,
@@ -109,6 +153,7 @@ impl Supervisor {
                 auto_restart,
                 _process_type,
                 command_factory,
+                probe,
                 tx,
                 cancel_clone,
                 pid_clone,
@@ -136,6 +181,7 @@ impl Supervisor {
         auto_restart: bool,
         process_type: TunnelProcessType,
         command_factory: CommandFactory,
+        probe: Option<ReadinessProbe>,
         tx: mpsc::UnboundedSender<TunnelEvent>,
     ) -> Self {
         let cancel = CancellationToken::new();
@@ -153,6 +199,7 @@ impl Supervisor {
                 auto_restart,
                 process_type,
                 command_factory,
+                probe,
                 tx,
                 cancel_clone,
                 pid_clone,
@@ -166,6 +213,7 @@ impl Supervisor {
                 auto_restart,
                 process_type,
                 command_factory,
+                probe,
                 tx,
                 cancel_clone,
                 pid_clone,
@@ -313,6 +361,103 @@ impl Supervisor {
         Ok((pid, exit_rx))
     }
 
+    /// Wait until the tunnel is confirmed ready, or fails.
+    ///
+    /// When a `probe` is available, readiness is confirmed by establishing a
+    /// TCP connection to the tunnel's local listener — this only succeeds once
+    /// the underlying session is authenticated and the forward is actually
+    /// serving traffic. This avoids the false-positive where a process is alive
+    /// but the tunnel is still negotiating or on its way to timing out.
+    ///
+    /// When no probe is available (e.g. remote-only `-R` forwards, which expose
+    /// no local listener), it falls back to the stability-threshold heuristic:
+    /// the process must simply survive `STABILITY_THRESHOLD`.
+    ///
+    /// Returns `true` once the tunnel is ready, `false` if the process exited,
+    /// the probe timed out, or the channel closed.
+    #[cfg(unix)]
+    async fn wait_until_ready(
+        probe: Option<&ReadinessProbe>,
+        exit_rx: &mut mpsc::UnboundedReceiver<Option<i32>>,
+        tx: &mpsc::UnboundedSender<TunnelEvent>,
+        entry_id: uuid::Uuid,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let Some(probe) = probe else {
+            // No local listener to probe — fall back to the stability threshold.
+            return tokio::select! {
+                _ = cancel.cancelled() => false,
+                _ = tokio::time::sleep(STABILITY_THRESHOLD) => {
+                    match exit_rx.try_recv() {
+                        Ok(_code) => false, // process already exited
+                        Err(mpsc::error::TryRecvError::Empty) => true, // still running
+                        Err(mpsc::error::TryRecvError::Disconnected) => false, // channel closed
+                    }
+                }
+                exit_code = exit_rx.recv() => {
+                    let _ = exit_code; // ExitStatus already sent by the waiter task
+                    false
+                }
+            };
+        };
+
+        let _ = tx.send(TunnelEvent::Output {
+            entry_id,
+            stream: LogStream::System,
+            text: format!(
+                "Waiting for tunnel to accept connections on {}:{}",
+                probe.address, probe.port
+            ),
+        });
+
+        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+
+        loop {
+            // Bail out immediately if the process has already exited.
+            match exit_rx.try_recv() {
+                Ok(_) | Err(mpsc::error::TryRecvError::Disconnected) => return false,
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+
+            if Self::probe_once(probe).await {
+                return true;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                let _ = tx.send(TunnelEvent::Output {
+                    entry_id,
+                    stream: LogStream::Stderr,
+                    text: format!(
+                        "Timed out waiting for tunnel readiness on {}:{}",
+                        probe.address, probe.port
+                    ),
+                });
+                return false;
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => return false,
+                exit_code = exit_rx.recv() => {
+                    let _ = exit_code; // process died — ExitStatus already sent
+                    return false;
+                }
+                _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+            }
+        }
+    }
+
+    /// Attempt a single TCP connection to the probe target.
+    ///
+    /// Returns `true` if the connection succeeds within `PROBE_CONNECT_TIMEOUT`.
+    #[cfg(unix)]
+    async fn probe_once(probe: &ReadinessProbe) -> bool {
+        let addr = format!("{}:{}", probe.address, probe.port);
+        matches!(
+            tokio::time::timeout(PROBE_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr)).await,
+            Ok(Ok(_))
+        )
+    }
+
     /// Main supervision loop for spawn mode.
     ///
     /// Uses child.wait() for process monitoring and captures stdout/stderr.
@@ -322,6 +467,7 @@ impl Supervisor {
         entry_id: uuid::Uuid,
         auto_restart: bool,
         command_factory: CommandFactory,
+        probe: Option<ReadinessProbe>,
         tx: mpsc::UnboundedSender<TunnelEvent>,
         cancel: CancellationToken,
         current_pid: Arc<AtomicU32>,
@@ -340,24 +486,9 @@ impl Supervisor {
                     }
                 };
 
-            // Phase 1: Wait for stability threshold
-            let stable = tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(STABILITY_THRESHOLD) => {
-                    // Process survived the threshold — check if it's still alive
-                    // by seeing if exit_rx has a value ready
-                    match exit_rx.try_recv() {
-                        Ok(_code) => false, // process already exited
-                        Err(mpsc::error::TryRecvError::Empty) => true, // still running
-                        Err(mpsc::error::TryRecvError::Disconnected) => false, // channel closed
-                    }
-                }
-                exit_code = exit_rx.recv() => {
-                    // Process died before stability threshold
-                    let _ = exit_code; // ExitStatus already sent by the waiter task
-                    false
-                }
-            };
+            // Phase 1: Wait until the tunnel is confirmed ready.
+            let stable =
+                Self::wait_until_ready(probe.as_ref(), &mut exit_rx, &tx, entry_id, &cancel).await;
 
             if cancel.is_cancelled() {
                 return;
@@ -441,6 +572,7 @@ impl Supervisor {
         auto_restart: bool,
         process_type: TunnelProcessType,
         command_factory: CommandFactory,
+        probe: Option<ReadinessProbe>,
         tx: mpsc::UnboundedSender<TunnelEvent>,
         cancel: CancellationToken,
         current_pid: Arc<AtomicU32>,
@@ -455,8 +587,15 @@ impl Supervisor {
             text: format!("Adopted existing process (PID {pid}) — output capture unavailable"),
         });
 
-        // Phase 1: Wait for stability via polling
-        let stable = Self::wait_for_stability(pid, process_type, &cancel).await;
+        // Phase 1: Confirm readiness. Prefer a TCP probe of the local listener
+        // (a live PID alone does not prove the tunnel is serving traffic); fall
+        // back to PID-liveness polling when no local listener is available.
+        let stable = match probe.as_ref() {
+            Some(probe) => {
+                Self::wait_for_readiness_adopted(probe, pid, process_type, &cancel).await
+            }
+            None => Self::wait_for_stability(pid, process_type, &cancel).await,
+        };
 
         if cancel.is_cancelled() {
             return;
@@ -492,12 +631,47 @@ impl Supervisor {
             entry_id,
             auto_restart,
             command_factory,
+            probe,
             tx,
             cancel,
             current_pid,
             suspended,
         )
         .await;
+    }
+
+    /// Confirm readiness of an adopted process via a TCP probe of its local
+    /// listener, while also verifying the process stays alive.
+    ///
+    /// Returns `true` once the probe succeeds, `false` if the process dies, the
+    /// probe times out, or the supervision task is cancelled.
+    #[cfg(unix)]
+    async fn wait_for_readiness_adopted(
+        probe: &ReadinessProbe,
+        pid: u32,
+        process_type: TunnelProcessType,
+        cancel: &CancellationToken,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+
+        loop {
+            if cancel.is_cancelled() || !is_live_tunnel(pid, process_type) {
+                return false;
+            }
+
+            if Self::probe_once(probe).await {
+                return true;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => return false,
+                _ = tokio::time::sleep(PROBE_INTERVAL) => {}
+            }
+        }
     }
 
     /// Poll the PID until it has been alive for the stability threshold.

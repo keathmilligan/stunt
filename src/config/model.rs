@@ -190,6 +190,15 @@ impl K8sPortForward {
     pub fn display_address(&self) -> String {
         format!("{} -> :{}", self.local_port, self.remote_port)
     }
+
+    /// Returns the local listener `(address, port)` that `kubectl port-forward`
+    /// binds, for use as a readiness probe target.
+    pub fn local_listen_target(&self) -> (String, u16) {
+        (
+            normalize_bind_address(&self.local_bind_address),
+            self.local_port,
+        )
+    }
 }
 
 /// An sshuttle VPN-over-SSH session routing one or more subnets.
@@ -275,6 +284,20 @@ fn default_bind_address() -> String {
     "127.0.0.1".to_string()
 }
 
+/// Normalize a bind address into something connectable for a readiness probe.
+///
+/// SSH accepts `*`, an empty string, or `0.0.0.0` to mean "all interfaces".
+/// None of those are directly connectable, so map them to the loopback
+/// address, which is always reachable when the listener is bound to all
+/// interfaces.
+fn normalize_bind_address(bind_address: &str) -> String {
+    match bind_address.trim() {
+        "" | "*" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" => "::1".to_string(),
+        other => other.to_string(),
+    }
+}
+
 impl TunnelForward {
     /// Returns the ssh flag representation of this forward.
     pub fn to_ssh_flag(&self) -> String {
@@ -295,6 +318,29 @@ impl TunnelForward {
                 bind_address,
                 bind_port,
             } => format!("-D {bind_address}:{bind_port}"),
+        }
+    }
+
+    /// Returns the local listener `(address, port)` for this forward, if it
+    /// binds one locally.
+    ///
+    /// `Local` (`-L`) and `Dynamic` (`-D`) forwards bind a local listener that
+    /// only starts accepting connections once the SSH session is established,
+    /// making them usable as a readiness probe target. `Remote` (`-R`) forwards
+    /// bind on the *remote* side and expose no local listener, so they return
+    /// `None`.
+    pub fn local_listen_target(&self) -> Option<(String, u16)> {
+        match self {
+            TunnelForward::Local {
+                bind_address,
+                bind_port,
+                ..
+            }
+            | TunnelForward::Dynamic {
+                bind_address,
+                bind_port,
+            } => Some((normalize_bind_address(bind_address), *bind_port)),
+            TunnelForward::Remote { .. } => None,
         }
     }
 
@@ -424,6 +470,82 @@ mod tests {
             bind_port: 1080,
         };
         assert_eq!(fwd.to_ssh_flag(), "-D 127.0.0.1:1080");
+    }
+
+    #[test]
+    fn test_local_listen_target_local() {
+        let fwd = TunnelForward::Local {
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 5432,
+            remote_host: "db.internal".to_string(),
+            remote_port: 5432,
+        };
+        assert_eq!(
+            fwd.local_listen_target(),
+            Some(("127.0.0.1".to_string(), 5432))
+        );
+    }
+
+    #[test]
+    fn test_local_listen_target_dynamic() {
+        let fwd = TunnelForward::Dynamic {
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 1080,
+        };
+        assert_eq!(
+            fwd.local_listen_target(),
+            Some(("127.0.0.1".to_string(), 1080))
+        );
+    }
+
+    #[test]
+    fn test_local_listen_target_remote_is_none() {
+        // Remote (-R) forwards bind on the remote side, so there is no local
+        // listener to probe.
+        let fwd = TunnelForward::Remote {
+            bind_address: "127.0.0.1".to_string(),
+            bind_port: 8080,
+            remote_host: "localhost".to_string(),
+            remote_port: 3000,
+        };
+        assert_eq!(fwd.local_listen_target(), None);
+    }
+
+    #[test]
+    fn test_local_listen_target_normalizes_wildcard() {
+        for wildcard in ["*", "", "0.0.0.0"] {
+            let fwd = TunnelForward::Local {
+                bind_address: wildcard.to_string(),
+                bind_port: 9000,
+                remote_host: "db.internal".to_string(),
+                remote_port: 9000,
+            };
+            assert_eq!(
+                fwd.local_listen_target(),
+                Some(("127.0.0.1".to_string(), 9000)),
+                "wildcard {wildcard:?} should normalize to loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_bind_address() {
+        assert_eq!(normalize_bind_address("127.0.0.1"), "127.0.0.1");
+        assert_eq!(normalize_bind_address("*"), "127.0.0.1");
+        assert_eq!(normalize_bind_address(""), "127.0.0.1");
+        assert_eq!(normalize_bind_address("0.0.0.0"), "127.0.0.1");
+        assert_eq!(normalize_bind_address("::"), "::1");
+        assert_eq!(normalize_bind_address("192.168.1.5"), "192.168.1.5");
+    }
+
+    #[test]
+    fn test_k8s_local_listen_target() {
+        let fwd = K8sPortForward {
+            local_bind_address: "127.0.0.1".to_string(),
+            local_port: 8080,
+            remote_port: 80,
+        };
+        assert_eq!(fwd.local_listen_target(), ("127.0.0.1".to_string(), 8080));
     }
 
     #[test]

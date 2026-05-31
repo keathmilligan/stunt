@@ -12,7 +12,7 @@ use crate::config::{
 };
 use crate::config::{SessionRecord, SessionState, load_sessions, save_sessions};
 use crate::demo::DemoUiEvent;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
     ConnectionState, LogStream, ProcessLog, ReadinessProbe, Supervisor, TunnelEvent,
@@ -1696,6 +1696,15 @@ impl App {
         self.connection_states
             .insert(id, ConnectionState::Connecting);
 
+        // Emit immediate feedback to the output area so the user sees activity
+        // as soon as they initiate a connection, before the supervisor's first
+        // message arrives.
+        self.process_logs.entry(id).or_default().push(
+            LogStream::System,
+            format!("Connecting to {}…", entry.name()),
+        );
+        self.log_scroll_offset = 0;
+
         let supervisor = match &entry {
             TunnelEntry::Ssh(ssh_entry) => {
                 let probe = ssh_readiness_probe(ssh_entry);
@@ -1778,6 +1787,10 @@ impl App {
         }
 
         if auto_restart {
+            self.process_logs.entry(id).or_default().push(
+                LogStream::System,
+                "Suspended (manual disconnect)".to_string(),
+            );
             self.connection_states
                 .insert(id, ConnectionState::Suspended);
             self.sessions.insert(
@@ -1789,6 +1802,10 @@ impl App {
                 },
             );
         } else {
+            self.process_logs
+                .entry(id)
+                .or_default()
+                .push(LogStream::System, "Disconnected (manual)".to_string());
             self.connection_states
                 .insert(id, ConnectionState::Disconnected);
             self.sessions.remove(&id);
@@ -1982,8 +1999,9 @@ impl App {
                 continue;
             }
 
-            // Determine process type for liveness check (used on unix only)
-            let _process_type = self
+            // Determine process type for the liveness/identity check.
+            #[cfg(any(unix, windows))]
+            let process_type = self
                 .entries
                 .iter()
                 .find(|e| e.id() == id)
@@ -1994,9 +2012,9 @@ impl App {
                 })
                 .unwrap_or(TunnelProcessType::Ssh);
 
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             if let Some(pid) = record.pid
-                && is_live_tunnel(pid, _process_type)
+                && is_live_tunnel(pid, process_type)
             {
                 // PID alive — adopt it. Show "connecting" until the supervisor's
                 // stability check confirms the tunnel and emits a Connected event;

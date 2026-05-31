@@ -8,6 +8,7 @@ mod tunnel;
 mod ui;
 
 use std::io;
+use std::time::Duration;
 
 use clap::Parser;
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -32,8 +33,33 @@ struct Cli {
     demo: bool,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Build the runtime manually (rather than `#[tokio::main]`) so we control
+    // its shutdown. The app intentionally leaves tunnel processes running on
+    // quit, which keeps their stdout/stderr pipes open; the detached reader
+    // tasks and the crossterm console reader are therefore parked on blocking
+    // I/O that never completes. If we let the runtime drop normally at the end
+    // of `main`, that drop blocks until those parked threads unwind (on Windows
+    // this requires a console event — hence the hang until Ctrl-C). Instead we
+    // run the app to completion, then force the runtime down with a short
+    // timeout so the process exits promptly regardless of parked I/O.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    let result = runtime.block_on(run());
+
+    // Force the runtime to stop within a bounded time, abandoning any tasks
+    // still parked on blocking reads (e.g. the console EventStream and the
+    // tunnel stdout/stderr readers on the still-running detached ssh process).
+    runtime.shutdown_timeout(Duration::from_millis(100));
+
+    result
+}
+
+/// Async application entry point. Runs the full TUI lifecycle and restores the
+/// terminal before returning.
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Load configuration (or build demo fixtures)
@@ -103,11 +129,37 @@ async fn main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Main event loop
+    // Run the main event loop, capturing its result so the terminal is always
+    // restored even if rendering or event handling fails partway through.
+    let loop_result = run_event_loop(&mut terminal, &mut app, &mut app_rx).await;
+
+    // Shutdown: cancel demo tasks or terminate all active supervisors
+    if let Some(cancel) = demo_cancel {
+        cancel.cancel();
+    }
+    app.shutdown();
+
+    // Restore terminal (always, regardless of loop_result)
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    loop_result
+}
+
+/// Drive the main event loop until the user quits or an error occurs.
+///
+/// Kept separate from `run` so the terminal can be unconditionally restored by
+/// the caller regardless of how this function returns.
+async fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    app_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> anyhow::Result<()> {
     while app.running {
         // Render
         terminal.draw(|frame| {
-            ui::draw(frame, &app);
+            ui::draw(frame, app);
         })?;
 
         // Drain all pending demo UI events before processing keyboard input.
@@ -229,17 +281,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-
-    // Shutdown: cancel demo tasks or terminate all active supervisors
-    if let Some(cancel) = demo_cancel {
-        cancel.cancel();
-    }
-    app.shutdown();
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
 
     Ok(())
 }

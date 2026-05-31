@@ -9,7 +9,7 @@ mod supervisor;
 pub use command::{build_kubectl_command, build_ssh_command, build_sshuttle_command};
 pub use output::{LogStream, ProcessLog};
 pub use pid::TunnelProcessType;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use pid::is_live_tunnel;
 pub use state::{ConnectionState, TunnelEvent};
 pub use supervisor::{ReadinessProbe, Supervisor};

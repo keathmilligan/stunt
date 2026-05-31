@@ -13,58 +13,46 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-#[cfg(unix)]
 use std::time::Duration;
 
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(unix)]
 use super::command::{command_display, spawn_detached_cmd};
-#[cfg(unix)]
 use super::output::LogStream;
 use super::pid::TunnelProcessType;
-#[cfg(unix)]
 use super::pid::is_live_tunnel;
 use super::state::TunnelEvent;
 
 /// PID polling interval — how often we check if the tunnel process is alive
 /// (used only for adopted processes where we don't have a child handle).
-#[cfg(unix)]
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Stability threshold — how long the process must run before we consider
 /// it "connected" when no readiness probe is available (e.g. remote-only
 /// forwards). Probe-capable tunnels confirm readiness by connecting to the
 /// local listener instead of relying on this timer.
-#[cfg(unix)]
 const STABILITY_THRESHOLD: Duration = Duration::from_secs(3);
 
 /// How often to attempt a readiness probe against the local listener while
 /// waiting for the tunnel to come up.
-#[cfg(unix)]
 const PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Maximum time to wait for a readiness probe to succeed before giving up and
 /// treating the connection attempt as failed.
-#[cfg(unix)]
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Per-attempt TCP connect timeout for a single readiness probe.
-#[cfg(unix)]
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum reconnect attempts before marking as failed.
-#[cfg(unix)]
 const MAX_RETRIES: u32 = 10;
 
 /// Maximum backoff delay in seconds.
-#[cfg(unix)]
 const MAX_BACKOFF_SECS: u64 = 60;
 
 /// Base backoff delay in seconds.
-#[cfg(unix)]
 const BASE_BACKOFF_SECS: u64 = 1;
 
 /// A factory function that builds a fresh `Command` for reconnection attempts.
@@ -80,14 +68,8 @@ type CommandFactory = Box<dyn Fn() -> Command + Send + 'static>;
 #[derive(Debug, Clone)]
 pub struct ReadinessProbe {
     /// Local address the tunnel listens on (e.g. "127.0.0.1").
-    ///
-    /// Only read by the unix readiness-probe path; constructed on all platforms.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub address: String,
     /// Local port the tunnel listens on.
-    ///
-    /// Only read by the unix readiness-probe path; constructed on all platforms.
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub port: u16,
 }
 
@@ -140,8 +122,8 @@ impl Supervisor {
         let suspended = Arc::new(AtomicBool::new(false));
         let suspended_clone = suspended.clone();
 
+        let _ = _process_type;
         let handle = tokio::spawn(async move {
-            #[cfg(unix)]
             Self::run_spawn(
                 entry_id,
                 auto_restart,
@@ -153,18 +135,6 @@ impl Supervisor {
                 suspended_clone,
             )
             .await;
-            #[cfg(not(unix))]
-            let _ = (
-                entry_id,
-                auto_restart,
-                _process_type,
-                command_factory,
-                probe,
-                tx,
-                cancel_clone,
-                pid_clone,
-                suspended_clone,
-            );
         });
 
         Supervisor {
@@ -198,7 +168,6 @@ impl Supervisor {
         let suspended_clone = suspended.clone();
 
         let handle = tokio::spawn(async move {
-            #[cfg(unix)]
             Self::run_adopt(
                 entry_id,
                 pid,
@@ -212,19 +181,6 @@ impl Supervisor {
                 suspended_clone,
             )
             .await;
-            #[cfg(not(unix))]
-            let _ = (
-                entry_id,
-                pid,
-                auto_restart,
-                process_type,
-                command_factory,
-                probe,
-                tx,
-                cancel_clone,
-                pid_clone,
-                suspended_clone,
-            );
         });
 
         Supervisor {
@@ -247,15 +203,28 @@ impl Supervisor {
     /// Used when the user explicitly disconnects a tunnel.
     pub fn cancel_and_kill(&self) {
         self.cancel.cancel();
+        let pid = self.current_pid.load(Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
         #[cfg(unix)]
         {
-            let pid = self.current_pid.load(Ordering::Relaxed);
-            if pid > 0 {
-                // Safety: SIGTERM is a standard signal. We only send it to a PID we spawned.
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
+            // Safety: SIGTERM is a standard signal. We only send it to a PID we spawned.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
+        }
+        #[cfg(windows)]
+        {
+            // There is no signal mechanism on Windows; terminate the process
+            // tree with taskkill. `/T` includes child processes (e.g. ssh's
+            // helper processes), `/F` forces termination. We only target a PID
+            // we spawned ourselves. Detached so it cannot block the UI thread.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
         }
     }
 
@@ -276,12 +245,12 @@ impl Supervisor {
     ///
     /// Stdout and stderr are each read line-by-line in background tasks that
     /// forward lines as `TunnelEvent::Output`.
-    #[cfg(unix)]
     fn spawn_and_capture(
         entry_id: uuid::Uuid,
         command_factory: &CommandFactory,
         tx: &mpsc::UnboundedSender<TunnelEvent>,
         current_pid: &Arc<AtomicU32>,
+        cancel: &CancellationToken,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Option<i32>>), String> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -309,56 +278,87 @@ impl Supervisor {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        // Spawn stdout reader
+        // Spawn stdout reader. The reader is parked on a pipe that only closes
+        // when the process exits; since the process is intentionally left
+        // running on TUI quit, we also race the cancellation token so the task
+        // unwinds promptly on shutdown instead of blocking runtime teardown.
         if let Some(stdout) = stdout {
             let tx = tx.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx
-                        .send(TunnelEvent::Output {
-                            entry_id,
-                            stream: LogStream::Stdout,
-                            text: line,
-                        })
-                        .is_err()
-                    {
-                        break;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        next = lines.next_line() => match next {
+                            Ok(Some(line)) => {
+                                if tx
+                                    .send(TunnelEvent::Output {
+                                        entry_id,
+                                        stream: LogStream::Stdout,
+                                        text: line,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        },
                     }
                 }
             });
         }
 
-        // Spawn stderr reader
+        // Spawn stderr reader (same cancellation handling as stdout).
         if let Some(stderr) = stderr {
             let tx = tx.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if tx
-                        .send(TunnelEvent::Output {
-                            entry_id,
-                            stream: LogStream::Stderr,
-                            text: line,
-                        })
-                        .is_err()
-                    {
-                        break;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        next = lines.next_line() => match next {
+                            Ok(Some(line)) => {
+                                if tx
+                                    .send(TunnelEvent::Output {
+                                        entry_id,
+                                        stream: LogStream::Stderr,
+                                        text: line,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        },
                     }
                 }
             });
         }
 
-        // Spawn a task that waits for the child to exit and sends the result
+        // Spawn a task that waits for the child to exit and sends the result.
+        // On cancellation we stop waiting and drop the child handle without
+        // killing it — graceful TUI quit deliberately leaves the tunnel
+        // running (the process is detached). `kill_on_drop` is not set, so
+        // dropping the handle does not terminate the process.
         let (exit_tx, exit_rx) = mpsc::unbounded_channel();
         let tx_exit = tx.clone();
+        let cancel_wait = cancel.clone();
         tokio::spawn(async move {
-            let status = child.wait().await;
-            let code = match status {
-                Ok(s) => s.code(),
-                Err(_) => None,
+            let code = tokio::select! {
+                biased;
+                _ = cancel_wait.cancelled() => return,
+                status = child.wait() => match status {
+                    Ok(s) => s.code(),
+                    Err(_) => None,
+                },
             };
             let _ = tx_exit.send(TunnelEvent::ExitStatus { entry_id, code });
             let _ = exit_tx.send(code);
@@ -381,7 +381,6 @@ impl Supervisor {
     ///
     /// Returns `true` once the tunnel is ready, `false` if the process exited,
     /// the probe timed out, or the channel closed.
-    #[cfg(unix)]
     async fn wait_until_ready(
         probe: Option<&ReadinessProbe>,
         exit_rx: &mut mpsc::UnboundedReceiver<Option<i32>>,
@@ -455,7 +454,6 @@ impl Supervisor {
     /// Attempt a single TCP connection to the probe target.
     ///
     /// Returns `true` if the connection succeeds within `PROBE_CONNECT_TIMEOUT`.
-    #[cfg(unix)]
     async fn probe_once(probe: &ReadinessProbe) -> bool {
         let addr = format!("{}:{}", probe.address, probe.port);
         matches!(
@@ -467,7 +465,6 @@ impl Supervisor {
     /// Main supervision loop for spawn mode.
     ///
     /// Uses child.wait() for process monitoring and captures stdout/stderr.
-    #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     async fn run_spawn(
         entry_id: uuid::Uuid,
@@ -483,14 +480,19 @@ impl Supervisor {
 
         loop {
             // Spawn the process and start capturing output
-            let (_pid, mut exit_rx) =
-                match Self::spawn_and_capture(entry_id, &command_factory, &tx, &current_pid) {
-                    Ok(result) => result,
-                    Err(reason) => {
-                        let _ = tx.send(TunnelEvent::Failed { entry_id, reason });
-                        return;
-                    }
-                };
+            let (_pid, mut exit_rx) = match Self::spawn_and_capture(
+                entry_id,
+                &command_factory,
+                &tx,
+                &current_pid,
+                &cancel,
+            ) {
+                Ok(result) => result,
+                Err(reason) => {
+                    let _ = tx.send(TunnelEvent::Failed { entry_id, reason });
+                    return;
+                }
+            };
 
             // Phase 1: Wait until the tunnel is confirmed ready.
             let stable =
@@ -570,7 +572,6 @@ impl Supervisor {
     /// Main supervision loop for adopt mode.
     ///
     /// Uses PID polling since we don't have a child handle for adopted processes.
-    #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     async fn run_adopt(
         entry_id: uuid::Uuid,
@@ -651,7 +652,6 @@ impl Supervisor {
     ///
     /// Returns `true` once the probe succeeds, `false` if the process dies, the
     /// probe times out, or the supervision task is cancelled.
-    #[cfg(unix)]
     async fn wait_for_readiness_adopted(
         probe: &ReadinessProbe,
         pid: u32,
@@ -683,7 +683,6 @@ impl Supervisor {
     /// Poll the PID until it has been alive for the stability threshold.
     ///
     /// Returns `true` if the process survived the threshold, `false` if it died.
-    #[cfg(unix)]
     async fn wait_for_stability(
         pid: u32,
         process_type: TunnelProcessType,
@@ -713,7 +712,6 @@ impl Supervisor {
     }
 
     /// Poll until the PID is no longer alive, or cancellation.
-    #[cfg(unix)]
     async fn poll_until_dead(
         pid: u32,
         process_type: TunnelProcessType,

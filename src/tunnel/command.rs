@@ -139,7 +139,6 @@ pub fn build_sshuttle_command(entry: &SshuttleEntry) -> Command {
 /// Renders the program followed by its arguments, quoting any token that
 /// contains whitespace or is empty. Intended for display in the process
 /// output area, not for re-execution.
-#[cfg(any(unix, test))]
 pub fn command_display(cmd: &Command) -> String {
     let std_cmd = cmd.as_std();
 
@@ -153,7 +152,6 @@ pub fn command_display(cmd: &Command) -> String {
 }
 
 /// Quote a single command token if it contains whitespace or is empty.
-#[cfg(any(unix, test))]
 fn quote_token(token: &str) -> String {
     if token.is_empty() || token.chars().any(char::is_whitespace) {
         format!("'{}'", token.replace('\'', "'\\''"))
@@ -162,15 +160,19 @@ fn quote_token(token: &str) -> String {
     }
 }
 
-/// Spawn the given command detached in a new session.
+/// Spawn the given command detached from the TUI's terminal/console.
 ///
-/// Calls `setsid()` via `pre_exec` so the process survives the TUI
-/// exiting. Returns the child handle with stdout/stderr pipes available
-/// for reading.
+/// On Unix, calls `setsid()` via `pre_exec` so the process becomes a session
+/// leader and survives the TUI exiting.
 ///
+/// On Windows, sets the `CREATE_NEW_PROCESS_GROUP` and `CREATE_NO_WINDOW`
+/// creation flags so the child does not share the TUI's Ctrl-C handling and
+/// does not flash a console window of its own.
+///
+/// Returns the child handle with stdout/stderr pipes available for reading.
 /// The caller is responsible for reading from the pipes. If the TUI exits
 /// gracefully, dropping the child handle is sufficient — the process
-/// continues running in its own session.
+/// continues running independently.
 #[cfg(unix)]
 pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<tokio::process::Child> {
     // Safety: setsid() is async-signal-safe and has no preconditions beyond
@@ -184,6 +186,27 @@ pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<tokio::process::Ch
             Ok(())
         });
     }
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
+
+    Ok(child)
+}
+
+/// Spawn the given command detached from the TUI's console (Windows).
+///
+/// See the Unix variant for the cross-platform contract.
+#[cfg(windows)]
+pub fn spawn_detached_cmd(mut cmd: Command) -> anyhow::Result<tokio::process::Child> {
+    // CREATE_NEW_PROCESS_GROUP (0x0000_0200): the child becomes the root of a
+    // new process group so Ctrl-C/Ctrl-Break sent to the TUI does not also
+    // terminate the tunnel, and so we can target the group when killing.
+    // CREATE_NO_WINDOW (0x0800_0000): do not allocate a visible console window
+    // for the child (ssh/kubectl are console apps and would otherwise flash one).
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 
     let child = cmd
         .spawn()
@@ -575,5 +598,110 @@ mod tests {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
+    }
+
+    /// Integration test (Windows): spawn a detached process with the
+    /// creation flags applied and verify stdout is captured. This exercises
+    /// the same code path the supervisor uses to run `ssh` on Windows.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_spawn_detached_process_captures_stdout() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut cmd = tokio::process::Command::new("cmd");
+        cmd.arg("/C").arg("echo hello-from-stunt");
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = spawn_detached_cmd(cmd).expect("failed to spawn cmd");
+        assert!(child.id().is_some(), "child should have a PID");
+
+        let stdout = child.stdout.take().expect("stdout pipe missing");
+        let mut lines = BufReader::new(stdout).lines();
+        let first = lines
+            .next_line()
+            .await
+            .expect("read error")
+            .expect("expected a line of output");
+        assert_eq!(first.trim(), "hello-from-stunt");
+
+        let status = child.wait().await.expect("wait failed");
+        assert!(status.success(), "process should exit successfully");
+    }
+
+    /// Regression test for the quit-hang bug: a reader task parked on the
+    /// stdout pipe of a *still-running* detached process must unwind promptly
+    /// when its cancellation token fires, without waiting for the process to
+    /// exit. This mirrors the supervisor's stdout/stderr reader behaviour on
+    /// graceful TUI quit (the tunnel is intentionally left running).
+    #[tokio::test]
+    async fn test_reader_task_unblocks_on_cancel_while_process_alive() {
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio_util::sync::CancellationToken;
+
+        // A long-lived process that holds its stdout pipe open without ever
+        // emitting EOF for the duration of the test.
+        let mut cmd = if cfg!(windows) {
+            let mut c = tokio::process::Command::new("ping");
+            // -n 30 -> ~30s of runtime; -w keeps it quiet enough for the test.
+            c.args(["-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdin(Stdio::null());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = spawn_detached_cmd(cmd).expect("failed to spawn");
+        let pid = child.id().expect("child has no PID");
+        let stdout = child.stdout.take().expect("stdout pipe missing");
+
+        let cancel = CancellationToken::new();
+        let cancel_reader = cancel.clone();
+
+        // Reader parked on the pipe, racing the cancellation token — same
+        // pattern as Supervisor::spawn_and_capture.
+        let reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_reader.cancelled() => break,
+                    next = lines.next_line() => match next {
+                        Ok(Some(_)) => {}
+                        _ => break,
+                    },
+                }
+            }
+        });
+
+        // Fire cancellation and confirm the reader task completes quickly even
+        // though the process is still alive and its pipe is still open.
+        cancel.cancel();
+        let joined = tokio::time::timeout(Duration::from_secs(2), reader).await;
+        assert!(
+            joined.is_ok(),
+            "reader task should unwind promptly on cancel while process is alive"
+        );
+
+        // Clean up the still-running process.
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        let _ = child.wait().await;
     }
 }

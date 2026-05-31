@@ -1264,14 +1264,9 @@ impl App {
         match form.focus {
             FormFocus::ForwardEdit {
                 editing_index: Some(idx),
-            } => {
-                if idx < form.forwards.len() {
-                    form.forwards[idx] = fwd;
-                    form.selected_forward = idx;
-                } else {
-                    form.forwards.push(fwd);
-                    form.selected_forward = form.forwards.len() - 1;
-                }
+            } if idx < form.forwards.len() => {
+                form.forwards[idx] = fwd;
+                form.selected_forward = idx;
             }
             _ => {
                 form.forwards.push(fwd);
@@ -1420,14 +1415,9 @@ impl App {
         match form.focus {
             FormFocus::ForwardEdit {
                 editing_index: Some(idx),
-            } => {
-                if idx < form.k8s_forwards.len() {
-                    form.k8s_forwards[idx] = fwd;
-                    form.selected_forward = idx;
-                } else {
-                    form.k8s_forwards.push(fwd);
-                    form.selected_forward = form.k8s_forwards.len() - 1;
-                }
+            } if idx < form.k8s_forwards.len() => {
+                form.k8s_forwards[idx] = fwd;
+                form.selected_forward = idx;
             }
             _ => {
                 form.k8s_forwards.push(fwd);

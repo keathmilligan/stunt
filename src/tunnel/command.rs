@@ -126,6 +126,32 @@ pub fn build_sshuttle_command(entry: &SshuttleEntry) -> Command {
     cmd
 }
 
+/// Format a `Command` into a human-readable, shell-like string.
+///
+/// Renders the program followed by its arguments, quoting any token that
+/// contains whitespace or is empty. Intended for display in the process
+/// output area, not for re-execution.
+pub fn command_display(cmd: &Command) -> String {
+    let std_cmd = cmd.as_std();
+
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(quote_token(&std_cmd.get_program().to_string_lossy()));
+    for arg in std_cmd.get_args() {
+        parts.push(quote_token(&arg.to_string_lossy()));
+    }
+
+    parts.join(" ")
+}
+
+/// Quote a single command token if it contains whitespace or is empty.
+fn quote_token(token: &str) -> String {
+    if token.is_empty() || token.chars().any(char::is_whitespace) {
+        format!("'{}'", token.replace('\'', "'\\''"))
+    } else {
+        token.to_string()
+    }
+}
+
 /// Spawn the given command detached in a new session.
 ///
 /// Calls `setsid()` via `pre_exec` so the process survives the TUI
@@ -163,6 +189,37 @@ mod tests {
         K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry, TunnelForward,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn test_command_display_quotes_tokens_with_whitespace() {
+        let entry = ServerEntry {
+            id: Uuid::new_v4(),
+            name: "test".to_string(),
+            host: "example.com".to_string(),
+            port: 2222,
+            user: Some("deploy".to_string()),
+            identity_file: None,
+            forwards: vec![],
+            auto_restart: false,
+        };
+        let cmd = build_ssh_command(&entry);
+        let display = command_display(&cmd);
+
+        assert!(display.starts_with("ssh "));
+        assert!(display.contains("-N"));
+        assert!(display.contains("-o ExitOnForwardFailure=yes"));
+        assert!(display.contains("-p 2222"));
+        assert!(display.contains("-l deploy"));
+        assert!(display.ends_with("example.com"));
+    }
+
+    #[test]
+    fn test_quote_token() {
+        assert_eq!(quote_token("ssh"), "ssh");
+        assert_eq!(quote_token("a b"), "'a b'");
+        assert_eq!(quote_token(""), "''");
+        assert_eq!(quote_token("it's"), "it's");
+    }
 
     #[test]
     fn test_build_ssh_command_basic() {

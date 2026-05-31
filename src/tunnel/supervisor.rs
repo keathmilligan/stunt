@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
-use super::command::spawn_detached_cmd;
+use super::command::{command_display, spawn_detached_cmd};
 #[cfg(unix)]
 use super::output::LogStream;
 use super::pid::TunnelProcessType;
@@ -231,7 +231,16 @@ impl Supervisor {
     ) -> Result<(u32, mpsc::UnboundedReceiver<Option<i32>>), String> {
         use tokio::io::{AsyncBufReadExt, BufReader};
 
-        let mut child = match spawn_detached_cmd(command_factory()) {
+        let command = command_factory();
+
+        // Emit the command being executed to the process output area.
+        let _ = tx.send(TunnelEvent::Output {
+            entry_id,
+            stream: LogStream::System,
+            text: format!("$ {}", command_display(&command)),
+        });
+
+        let mut child = match spawn_detached_cmd(command) {
             Ok(child) => child,
             Err(e) => return Err(format!("failed to spawn process: {e}")),
         };

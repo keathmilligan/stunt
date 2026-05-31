@@ -56,8 +56,11 @@ pub fn build_ssh_command(entry: &ServerEntry) -> Command {
 ///
 /// The command form is:
 /// ```text
-/// kubectl port-forward [--context <ctx>] [-n <namespace>] <type>/<name> <bind>:<local>:<remote>
+/// kubectl port-forward [--context <ctx>] [-n <namespace>] [--address <bind>] <type>/<name> <local>:<remote>
 /// ```
+///
+/// Note: the bind address is passed via the `--address` flag, not embedded in
+/// the port-mapping argument (kubectl rejects `<bind>:<local>:<remote>`).
 pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Command {
     let mut cmd = Command::new("kubectl");
 
@@ -73,6 +76,11 @@ pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Comm
 
     if let Some(ref ns) = entry.namespace {
         cmd.arg("-n").arg(ns);
+    }
+
+    let address = forward.kubectl_address();
+    if !address.is_empty() {
+        cmd.arg("--address").arg(address);
     }
 
     cmd.arg(entry.resource_identifier());
@@ -358,7 +366,12 @@ mod tests {
         assert!(args.contains(&"-n".to_string()));
         assert!(args.contains(&"default".to_string()));
         assert!(args.contains(&"deployment/api".to_string()));
-        assert!(args.contains(&"127.0.0.1:8080:80".to_string()));
+        // Bind address goes through --address, not the port-mapping arg.
+        assert!(args.contains(&"--address".to_string()));
+        assert!(args.contains(&"127.0.0.1".to_string()));
+        assert!(args.contains(&"8080:80".to_string()));
+        // The old <bind>:<local>:<remote> form must not be emitted.
+        assert!(!args.contains(&"127.0.0.1:8080:80".to_string()));
     }
 
     #[test]
@@ -376,7 +389,8 @@ mod tests {
         assert!(!args.contains(&"--context".to_string()));
         assert!(!args.contains(&"-n".to_string()));
         assert!(args.contains(&"service/postgres".to_string()));
-        assert!(args.contains(&"127.0.0.1:5432:5432".to_string()));
+        assert!(args.contains(&"5432:5432".to_string()));
+        assert!(!args.contains(&"127.0.0.1:5432:5432".to_string()));
     }
 
     #[test]

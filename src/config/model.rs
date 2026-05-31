@@ -178,12 +178,21 @@ pub struct K8sPortForward {
 
 impl K8sPortForward {
     /// Returns the port-mapping argument for `kubectl port-forward`
-    /// in the form `<bind>:<local>:<remote>`.
+    /// in the form `<local>:<remote>`.
+    ///
+    /// Note: kubectl does *not* accept a bind address in this argument — the
+    /// bind address is passed separately via the `--address` flag. See
+    /// [`Self::kubectl_address`].
     pub fn kubectl_arg(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.local_bind_address, self.local_port, self.remote_port
-        )
+        format!("{}:{}", self.local_port, self.remote_port)
+    }
+
+    /// Returns the bind address for the `kubectl port-forward --address` flag.
+    ///
+    /// kubectl binds to `localhost` by default; this returns the configured
+    /// bind address so non-default binds (or explicit ones) are honored.
+    pub fn kubectl_address(&self) -> &str {
+        &self.local_bind_address
     }
 
     /// Returns a human-readable display string.
@@ -596,7 +605,8 @@ mod tests {
             remote_port: 80,
         };
         assert_eq!(fwd.local_bind_address, "127.0.0.1");
-        assert_eq!(fwd.kubectl_arg(), "127.0.0.1:8080:80");
+        assert_eq!(fwd.kubectl_arg(), "8080:80");
+        assert_eq!(fwd.kubectl_address(), "127.0.0.1");
         assert_eq!(fwd.display_address(), "8080 -> :80");
     }
 

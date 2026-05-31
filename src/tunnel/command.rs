@@ -139,6 +139,7 @@ pub fn build_sshuttle_command(entry: &SshuttleEntry) -> Command {
 /// Renders the program followed by its arguments, quoting any token that
 /// contains whitespace or is empty. Intended for display in the process
 /// output area, not for re-execution.
+#[cfg(any(unix, test))]
 pub fn command_display(cmd: &Command) -> String {
     let std_cmd = cmd.as_std();
 
@@ -152,6 +153,7 @@ pub fn command_display(cmd: &Command) -> String {
 }
 
 /// Quote a single command token if it contains whitespace or is empty.
+#[cfg(any(unix, test))]
 fn quote_token(token: &str) -> String {
     if token.is_empty() || token.chars().any(char::is_whitespace) {
         format!("'{}'", token.replace('\'', "'\\''"))

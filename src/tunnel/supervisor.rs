@@ -80,8 +80,14 @@ type CommandFactory = Box<dyn Fn() -> Command + Send + 'static>;
 #[derive(Debug, Clone)]
 pub struct ReadinessProbe {
     /// Local address the tunnel listens on (e.g. "127.0.0.1").
+    ///
+    /// Only read by the unix readiness-probe path; constructed on all platforms.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub address: String,
     /// Local port the tunnel listens on.
+    ///
+    /// Only read by the unix readiness-probe path; constructed on all platforms.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub port: u16,
 }
 

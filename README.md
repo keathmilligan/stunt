@@ -49,12 +49,12 @@ Stay up-to-date with `brew upgrade stunt`.
 
 See the [macOS Install Guide](docs/install-macos.md) for other ways to install on macOS.
 
-### Windows (PowerShell)
+### Windows (winget)
 
 In an elevated powershell session, run:
 
 ```powershell
-irm https://packages.keathmilligan.net/stunt/install.ps1 | iex
+winget install stunt
 ```
 
 See the [Windows Install Guide](docs/install-windows.md) for other ways to install on Windows.

@@ -1,5 +1,15 @@
 # Windows Installation Guide
 
+## winget
+
+Microsoft's `winget` is the recommended installation method for Windows:
+
+In an elevated powershell session, run:
+
+```powershell
+winget install stunt
+```
+
 ## PowerShell Installer
 
 In an elevated powershell session, run:

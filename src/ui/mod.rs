@@ -1016,17 +1016,18 @@ fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App, selected_id: Opti
     let total_lines = log.len();
     let scroll_offset = app.log_scroll_offset;
 
-    // Calculate which lines to show. We display from the bottom (newest) up,
-    // with scroll_offset moving the window upward.
+    // Determine the logical-line window to consider. `scroll_offset` is measured
+    // in logical (pre-wrap) lines from the bottom. We expand the window with a
+    // little headroom above so wrapped continuation rows don't cause newer lines
+    // to be pushed out of view before windowing on visual rows below.
     let end = total_lines.saturating_sub(scroll_offset);
     let start = end.saturating_sub(viewport_height);
 
-    let log_lines: Vec<Line> = log
-        .iter()
-        .skip(start)
-        .take(end - start)
-        .map(|log_line| colorize_log_line(log_line, log_area.width))
-        .collect();
+    // Wrap each logical line into one-or-more visual rows (with hanging indent).
+    let mut visual_lines: Vec<Line> = Vec::new();
+    for log_line in log.iter().skip(start).take(end - start) {
+        visual_lines.extend(colorize_log_line(log_line, log_area.width));
+    }
 
     // Show scroll indicator if not at bottom
     let scroll_indicator = if scroll_offset > 0 {
@@ -1035,7 +1036,21 @@ fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App, selected_id: Opti
         String::new()
     };
 
-    if !scroll_indicator.is_empty() && log_area.height > 1 {
+    let show_indicator = !scroll_indicator.is_empty() && log_area.height > 1;
+    let content_height = if show_indicator {
+        (log_area.height - 1) as usize
+    } else {
+        viewport_height
+    };
+
+    // Bottom-anchor the visual rows to the available content height so the
+    // newest output stays visible even after wrapping expands earlier lines.
+    if visual_lines.len() > content_height {
+        let drop = visual_lines.len() - content_height;
+        visual_lines.drain(0..drop);
+    }
+
+    if show_indicator {
         // Show scroll indicator at bottom of log area
         let indicator_area = Rect {
             x: log_area.x,
@@ -1061,14 +1076,21 @@ fn render_log_viewer(frame: &mut Frame, area: Rect, app: &App, selected_id: Opti
             width: log_area.width,
             height: log_area.height - 1,
         };
-        frame.render_widget(Paragraph::new(log_lines), content_area);
+        frame.render_widget(Paragraph::new(visual_lines), content_area);
     } else {
-        frame.render_widget(Paragraph::new(log_lines), log_area);
+        frame.render_widget(Paragraph::new(visual_lines), log_area);
     }
 }
 
-/// Colorize a single log line based on its stream and content.
-fn colorize_log_line(log_line: &crate::tunnel::output::LogLine, _width: u16) -> Line<'_> {
+/// Colorize a single log line based on its stream and content, wrapping it to
+/// `width` columns.
+///
+/// The first visual row carries the timestamp + stream tag prefix; any
+/// continuation rows are indented with a hanging indent so the wrapped text
+/// aligns with the start of the message on the first row (i.e. the timestamp
+/// and stream tag columns are left blank on continuation rows). Returns one
+/// [`Line`] per visual row.
+fn colorize_log_line(log_line: &crate::tunnel::output::LogLine, width: u16) -> Vec<Line<'_>> {
     let ts_style = Style::default().fg(COLOR_LOG_TIMESTAMP);
 
     let text = log_line.text.as_str();
@@ -1111,11 +1133,66 @@ fn colorize_log_line(log_line: &crate::tunnel::output::LogLine, _width: u16) -> 
         LogStream::System => Span::styled(" sys ", Style::default().fg(COLOR_LOG_SYSTEM)),
     };
 
-    Line::from(vec![
-        Span::styled(format!(" {} ", log_line.timestamp), ts_style),
-        stream_tag,
-        Span::styled(text, text_style),
-    ])
+    // Prefix is " <timestamp> " (1 + len + 1) followed by the 5-char stream tag
+    // (e.g. " out "). The message begins immediately after; continuation rows
+    // are indented by this same width to form a hanging indent.
+    let prefix_width = log_line.timestamp.chars().count() + 2 + 5;
+
+    // Width available for the message text on each row.
+    let avail = (width as usize).saturating_sub(prefix_width).max(1);
+
+    let wrapped = wrap_text(text, avail);
+    let indent = " ".repeat(prefix_width);
+
+    let mut lines = Vec::with_capacity(wrapped.len().max(1));
+    for (i, segment) in wrapped.iter().enumerate() {
+        if i == 0 {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", log_line.timestamp), ts_style),
+                stream_tag.clone(),
+                Span::styled(segment.clone(), text_style),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw(indent.clone()),
+                Span::styled(segment.clone(), text_style),
+            ]));
+        }
+    }
+    if lines.is_empty() {
+        // Preserve empty log lines as a single (blank) row with the prefix.
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} ", log_line.timestamp), ts_style),
+            stream_tag,
+        ]));
+    }
+    lines
+}
+
+/// Hard-wrap `text` into segments of at most `width` characters each, breaking
+/// strictly on character boundaries (no word wrapping). Returns the segments in
+/// order; an empty input yields an empty vec.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in text.chars() {
+        current.push(ch);
+        current_width += 1;
+        if current_width == width {
+            segments.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+    }
+
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 // ── Type selection overlay ───────────────────────────────────────────────
@@ -1233,17 +1310,35 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                 Span::styled(hint, Style::default().fg(Color::DarkGray)),
             ]));
         } else if is_cycle {
-            let hint = if is_focused { "  (type to change)" } else { "" };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{:>14}: ", field.label), label_style),
-                Span::styled(
-                    &field.value,
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(hint, Style::default().fg(Color::DarkGray)),
-            ]));
+            // Radio-style selector: render every option, highlighting the
+            // currently selected one. Cycled with ←/→ (or Space).
+            const OPTIONS: [&str; 3] = ["pod", "service", "deployment"];
+            let mut spans: Vec<Span> =
+                vec![Span::styled(format!("{:>14}: ", field.label), label_style)];
+            for (oi, opt) in OPTIONS.iter().enumerate() {
+                if oi > 0 {
+                    spans.push(Span::raw("  "));
+                }
+                let selected = field.value == *opt;
+                let (marker, opt_style) = if selected {
+                    (
+                        "(•) ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    ("( ) ", Style::default().fg(Color::DarkGray))
+                };
+                spans.push(Span::styled(format!("{marker}{opt}"), opt_style));
+            }
+            if is_focused {
+                spans.push(Span::styled(
+                    "  (←/→ to change)",
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(Line::from(spans));
         } else {
             let value_style = if is_focused {
                 Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 60))
@@ -1451,5 +1546,61 @@ fn forward_styles(is_selected: bool) -> (Style, Style) {
             Style::default().fg(COLOR_FORWARD_LABEL),
             Style::default().fg(Color::White),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_text;
+
+    fn longest(segments: &[String]) -> usize {
+        segments
+            .iter()
+            .map(|s| s.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn hard_wraps_at_exact_character_boundary() {
+        let segs = wrap_text("the quick brown fox jumps", 10);
+        assert!(longest(&segs) <= 10, "segments: {segs:?}");
+        // Character-level wrap: spaces are preserved and the original text is
+        // reconstructed exactly by concatenation.
+        assert_eq!(segs.concat(), "the quick brown fox jumps");
+        assert_eq!(
+            segs,
+            vec![
+                "the quick ".to_string(),
+                "brown fox ".to_string(),
+                "jumps".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_overlong_word_on_character_boundary() {
+        let segs = wrap_text("supercalifragilisticexpialidocious", 8);
+        assert!(longest(&segs) <= 8, "segments: {segs:?}");
+        assert_eq!(segs.concat(), "supercalifragilisticexpialidocious");
+        assert_eq!(segs[0], "supercal");
+    }
+
+    #[test]
+    fn short_text_is_single_segment() {
+        let segs = wrap_text("hello", 40);
+        assert_eq!(segs, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn exact_width_is_single_segment() {
+        let segs = wrap_text("abcde", 5);
+        assert_eq!(segs, vec!["abcde".to_string()]);
+    }
+
+    #[test]
+    fn empty_text_yields_no_segments() {
+        let segs = wrap_text("", 40);
+        assert!(segs.is_empty());
     }
 }

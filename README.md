@@ -94,11 +94,15 @@ stunt
 |-----|--------|
 | `Tab` / `Down` | Next field |
 | `Shift+Tab` / `Up` | Previous field |
-| `Ctrl+A` | Add a new forward |
-| `Ctrl+D` | Delete selected forward |
-| `Ctrl+T` | Cycle forward type (Local / Remote / Dynamic for SSH; Pod / Service / Deployment for K8s) |
+| `←` / `→` (or `Space`) | Change a selection field (e.g. **Resource Type**: Pod / Service / Deployment) |
+| `Ctrl+A` | Add a new forward / port binding |
+| `Ctrl+D` | Delete selected forward / port binding |
+| `Ctrl+T` | Cycle SSH forward type (Local / Remote / Dynamic) while editing a forward |
 | `Enter` | Confirm field / save entry |
 | `Esc` | Cancel / go back |
+
+> **Resource Type** is a selection field, not free text. Use `←` / `→`
+> (or `Space`) to choose between **Pod**, **Service**, and **Deployment**.
 
 ## Configuration
 
@@ -135,6 +139,12 @@ auto_restart = true               # optional, default false
 
 ### Kubernetes Entry
 
+A Kubernetes entry wraps `kubectl port-forward`. Each entry targets a single
+resource (`<resource_type>/<resource_name>`) and may declare **multiple port
+bindings** — they are all forwarded by a single `kubectl port-forward`
+invocation, exactly like passing several `<local>:<remote>` arguments on the
+command line.
+
 ```toml
 [[entries]]
 type = "k8s"
@@ -151,6 +161,43 @@ auto_restart = false
 ```
 
 Supported `resource_type` values: `pod`, `service`, `deployment`.
+
+#### Example: replicating a `kubectl port-forward` command
+
+The command:
+
+```sh
+kubectl -n my-platform port-forward \
+  svc/my-platform-server-tls 18443:8443 19443:9443
+```
+
+is expressed as a single entry with **two port bindings**:
+
+```toml
+[[entries]]
+type = "k8s"
+name = "platform-server"
+namespace = "my-platform"
+resource_type = "service"             # svc/ → "service"
+resource_name = "my-platform-server-tls"
+auto_restart = false
+
+  [[entries.forwards]]
+  local_port = 18443
+  remote_port = 8443
+
+  [[entries.forwards]]
+  local_port = 19443
+  remote_port = 9443
+```
+
+In the TUI, create a Kubernetes entry, set **Resource Type** to `service`
+(using `←` / `→`), enter the resource name and namespace, then add each port
+binding with `Ctrl+A`. All bindings run under one `kubectl` process; the entry
+is considered "connected" once the first local listener is reachable.
+
+> **Note:** `svc` is shorthand for `service`. stunt uses the full
+> `service` / `pod` / `deployment` forms.
 
 ### sshuttle Entry
 

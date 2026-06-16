@@ -52,16 +52,21 @@ pub fn build_ssh_command(entry: &ServerEntry) -> Command {
     cmd
 }
 
-/// Build a `tokio::process::Command` for a single `kubectl port-forward` binding.
+/// Build a `tokio::process::Command` for a `kubectl port-forward` invocation
+/// covering *all* of the entry's port-forward bindings.
 ///
-/// The command form is:
+/// `kubectl port-forward` natively accepts multiple `<local>:<remote>` mappings
+/// in a single invocation, so every binding is forwarded by one process. The
+/// command form is:
 /// ```text
-/// kubectl port-forward [--context <ctx>] [-n <namespace>] [--address <bind>] <type>/<name> <local>:<remote>
+/// kubectl port-forward [--context <ctx>] [-n <namespace>] [--address <bind>[,<bind>...]] <type>/<name> <local>:<remote> [<local>:<remote> ...]
 /// ```
 ///
 /// Note: the bind address is passed via the `--address` flag, not embedded in
-/// the port-mapping argument (kubectl rejects `<bind>:<local>:<remote>`).
-pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Command {
+/// the port-mapping argument (kubectl rejects `<bind>:<local>:<remote>`). When
+/// bindings use different bind addresses they are joined into a single
+/// comma-separated `--address` list, which kubectl applies to all mappings.
+pub fn build_kubectl_command(entry: &K8sEntry, forwards: &[K8sPortForward]) -> Command {
     let mut cmd = Command::new("kubectl");
 
     cmd.arg("port-forward");
@@ -78,13 +83,26 @@ pub fn build_kubectl_command(entry: &K8sEntry, forward: &K8sPortForward) -> Comm
         cmd.arg("-n").arg(ns);
     }
 
-    let address = forward.kubectl_address();
-    if !address.is_empty() {
-        cmd.arg("--address").arg(address);
+    // Collect the distinct, non-empty bind addresses across all bindings,
+    // preserving first-seen order, and pass them as a single comma-separated
+    // `--address` list (kubectl applies the list to every mapping).
+    let mut addresses: Vec<&str> = Vec::new();
+    for forward in forwards {
+        let address = forward.kubectl_address();
+        if !address.is_empty() && !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    if !addresses.is_empty() {
+        cmd.arg("--address").arg(addresses.join(","));
     }
 
     cmd.arg(entry.resource_identifier());
-    cmd.arg(forward.kubectl_arg());
+
+    // One `<local>:<remote>` argument per binding.
+    for forward in forwards {
+        cmd.arg(forward.kubectl_arg());
+    }
 
     // Capture stdio so we can read process output in the supervisor.
     cmd.stdin(Stdio::null());
@@ -375,7 +393,7 @@ mod tests {
             "api",
         );
         let fwd = make_k8s_fwd(8080, 80);
-        let cmd = build_kubectl_command(&entry, &fwd);
+        let cmd = build_kubectl_command(&entry, &[fwd]);
 
         let prog = cmd.as_std().get_program().to_string_lossy().to_string();
         let args: Vec<String> = cmd
@@ -403,7 +421,7 @@ mod tests {
     fn test_build_kubectl_command_no_optional_fields() {
         let entry = make_k8s_entry(None, None, K8sResourceType::Service, "postgres");
         let fwd = make_k8s_fwd(5432, 5432);
-        let cmd = build_kubectl_command(&entry, &fwd);
+        let cmd = build_kubectl_command(&entry, &[fwd]);
 
         let args: Vec<String> = cmd
             .as_std()
@@ -428,7 +446,7 @@ mod tests {
             "api",
         );
         let fwd = make_k8s_fwd(8080, 80);
-        let cmd = build_kubectl_command(&entry, &fwd);
+        let cmd = build_kubectl_command(&entry, &[fwd]);
 
         let args: Vec<String> = cmd
             .as_std()
@@ -451,7 +469,7 @@ mod tests {
     fn test_build_kubectl_command_no_kubeconfig() {
         let entry = make_k8s_entry(None, None, K8sResourceType::Service, "postgres");
         let fwd = make_k8s_fwd(5432, 5432);
-        let cmd = build_kubectl_command(&entry, &fwd);
+        let cmd = build_kubectl_command(&entry, &[fwd]);
 
         let args: Vec<String> = cmd
             .as_std()
@@ -471,7 +489,7 @@ mod tests {
             "my-pod-abc",
         );
         let fwd = make_k8s_fwd(9090, 9090);
-        let cmd = build_kubectl_command(&entry, &fwd);
+        let cmd = build_kubectl_command(&entry, &[fwd]);
 
         let args: Vec<String> = cmd
             .as_std()
@@ -482,6 +500,62 @@ mod tests {
         assert!(args.contains(&"pod/my-pod-abc".to_string()));
         assert!(args.contains(&"-n".to_string()));
         assert!(args.contains(&"kube-system".to_string()));
+    }
+
+    #[test]
+    fn test_build_kubectl_command_multiple_forwards() {
+        // Mirrors:
+        //   kubectl -n ndr-platform port-forward \
+        //     svc/ndr-platform-ndrservermanager-tls 18443:8443 19443:9443
+        let entry = make_k8s_entry(
+            None,
+            Some("ndr-platform"),
+            K8sResourceType::Service,
+            "ndr-platform-ndrservermanager-tls",
+        );
+        let forwards = vec![make_k8s_fwd(18443, 8443), make_k8s_fwd(19443, 9443)];
+        let cmd = build_kubectl_command(&entry, &forwards);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.contains(&"-n".to_string()));
+        assert!(args.contains(&"ndr-platform".to_string()));
+        assert!(args.contains(&"service/ndr-platform-ndrservermanager-tls".to_string()));
+        // BOTH port mappings must be present in the single invocation.
+        assert!(args.contains(&"18443:8443".to_string()));
+        assert!(args.contains(&"19443:9443".to_string()));
+        // The resource identifier must precede both port-mapping args.
+        let res_idx = args
+            .iter()
+            .position(|a| a == "service/ndr-platform-ndrservermanager-tls")
+            .unwrap();
+        let p1 = args.iter().position(|a| a == "18443:8443").unwrap();
+        let p2 = args.iter().position(|a| a == "19443:9443").unwrap();
+        assert!(res_idx < p1 && res_idx < p2);
+        assert!(p1 < p2, "port mappings preserve definition order");
+    }
+
+    #[test]
+    fn test_build_kubectl_command_dedups_addresses() {
+        let entry = make_k8s_entry(None, Some("ns"), K8sResourceType::Service, "svc");
+        let forwards = vec![make_k8s_fwd(18443, 8443), make_k8s_fwd(19443, 9443)];
+        let cmd = build_kubectl_command(&entry, &forwards);
+
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        // Both bindings share 127.0.0.1, so a single --address is emitted.
+        let addr_count = args.iter().filter(|a| *a == "--address").count();
+        assert_eq!(addr_count, 1);
+        let addr_idx = args.iter().position(|a| a == "--address").unwrap();
+        assert_eq!(args[addr_idx + 1], "127.0.0.1");
     }
 
     fn make_sshuttle_entry(

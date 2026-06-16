@@ -140,6 +140,10 @@ pub enum Message {
     FormDeleteForward,
     /// Form: cycle forward type.
     FormCycleForwardType,
+    /// Form: advance a selection-type field (e.g. Resource Type) to the next option.
+    FormSelectNext,
+    /// Form: move a selection-type field (e.g. Resource Type) to the previous option.
+    FormSelectPrev,
     /// Log viewer: scroll up.
     LogScrollUp,
     /// Log viewer: scroll down (toward bottom).
@@ -690,7 +694,18 @@ impl App {
             Message::FormInput(ch) => {
                 match form.focus {
                     FormFocus::ServerFields => {
-                        if let Some(field) = form.fields.get_mut(form.focused_field) {
+                        let is_selection = form
+                            .fields
+                            .get(form.focused_field)
+                            .map(|f| Self::is_selection_field(&f.label))
+                            .unwrap_or(false);
+                        if is_selection {
+                            // Selection fields (e.g. Resource Type) cycle on Space
+                            // instead of accepting typed characters.
+                            if ch == ' ' {
+                                Self::cycle_selection_field(form, 1);
+                            }
+                        } else if let Some(field) = form.fields.get_mut(form.focused_field) {
                             if field.label == "Auto Restart" {
                                 if ch == ' ' {
                                     field.value = if field.value == "yes" {
@@ -716,7 +731,14 @@ impl App {
             }
             Message::FormBackspace => match form.focus {
                 FormFocus::ServerFields => {
-                    if let Some(field) = form.fields.get_mut(form.focused_field) {
+                    let is_selection = form
+                        .fields
+                        .get(form.focused_field)
+                        .map(|f| Self::is_selection_field(&f.label))
+                        .unwrap_or(false);
+                    if is_selection {
+                        Self::cycle_selection_field(form, -1);
+                    } else if let Some(field) = form.fields.get_mut(form.focused_field) {
                         if field.label == "Auto Restart" {
                             field.value = if field.value == "yes" {
                                 "no".to_string()
@@ -855,6 +877,16 @@ impl App {
                             // in the server fields (a dedicated field), not in forward sub-form.
                         }
                     }
+                }
+            }
+            Message::FormSelectNext => {
+                if matches!(form.focus, FormFocus::ServerFields) {
+                    Self::cycle_selection_field(form, 1);
+                }
+            }
+            Message::FormSelectPrev => {
+                if matches!(form.focus, FormFocus::ServerFields) {
+                    Self::cycle_selection_field(form, -1);
                 }
             }
             Message::FormSubmit => {
@@ -1016,6 +1048,32 @@ impl App {
     }
 
     /// Build a new empty K8s entry form.
+    /// The ordered set of options offered by the K8s "Resource Type" selection
+    /// field. These match [`K8sResourceType::as_str`].
+    const RESOURCE_TYPE_OPTIONS: [&'static str; 3] = ["pod", "service", "deployment"];
+
+    /// Returns whether the given field label denotes a selection-style field
+    /// (cycled through a fixed option set) rather than a free-text field.
+    fn is_selection_field(label: &str) -> bool {
+        label == "Resource Type"
+    }
+
+    /// Cycle the currently focused selection field's value by `delta` steps
+    /// (positive = forward, negative = backward), wrapping around the option set.
+    fn cycle_selection_field(form: &mut FormState, delta: isize) {
+        let Some(field) = form.fields.get_mut(form.focused_field) else {
+            return;
+        };
+        if field.label != "Resource Type" {
+            return;
+        }
+        let options = &Self::RESOURCE_TYPE_OPTIONS;
+        let current = options.iter().position(|o| *o == field.value).unwrap_or(0) as isize;
+        let len = options.len() as isize;
+        let next = ((current + delta) % len + len) % len;
+        field.value = options[next as usize].to_string();
+    }
+
     fn new_k8s_form() -> FormState {
         FormState {
             focused_field: 0,
@@ -1729,17 +1787,17 @@ impl App {
                     self.connection_states.insert(id, ConnectionState::Failed);
                     return;
                 }
-                // Spawn for the first forward only; additional forwards would need
-                // separate supervisor tracking — deferred to future multi-forward support.
-                let forward = k8s_entry.forwards[0].clone();
-                let (probe_addr, probe_port) = forward.local_listen_target();
+                // `kubectl port-forward` accepts every binding in a single
+                // invocation, so one supervisor/process handles all forwards.
+                // Probe the first binding's local listener for readiness.
+                let (probe_addr, probe_port) = k8s_entry.forwards[0].local_listen_target();
                 let probe = Some(ReadinessProbe::new(probe_addr, probe_port));
                 let k8s_entry = k8s_entry.clone();
                 Supervisor::spawn(
                     id,
                     k8s_entry.auto_restart,
                     TunnelProcessType::Kubectl,
-                    Box::new(move || build_kubectl_command(&k8s_entry, &forward)),
+                    Box::new(move || build_kubectl_command(&k8s_entry, &k8s_entry.forwards)),
                     probe,
                     self.tunnel_tx.clone(),
                 )
@@ -2046,8 +2104,7 @@ impl App {
                         if k8s.forwards.is_empty() {
                             continue;
                         }
-                        let forward = k8s.forwards[0].clone();
-                        let (probe_addr, probe_port) = forward.local_listen_target();
+                        let (probe_addr, probe_port) = k8s.forwards[0].local_listen_target();
                         let probe = Some(ReadinessProbe::new(probe_addr, probe_port));
                         let k8s = k8s.clone();
                         Supervisor::adopt(
@@ -2055,7 +2112,7 @@ impl App {
                             pid,
                             auto_restart,
                             TunnelProcessType::Kubectl,
-                            Box::new(move || build_kubectl_command(&k8s, &forward)),
+                            Box::new(move || build_kubectl_command(&k8s, &k8s.forwards)),
                             probe,
                             self.tunnel_tx.clone(),
                         )

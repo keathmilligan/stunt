@@ -246,6 +246,8 @@ async fn run_event_loop(
                                 KeyCode::Enter => Some(Message::FormSubmit),
                                 KeyCode::Tab | KeyCode::Down => Some(Message::FormNextField),
                                 KeyCode::BackTab | KeyCode::Up => Some(Message::FormPrevField),
+                                KeyCode::Right => Some(Message::FormSelectNext),
+                                KeyCode::Left => Some(Message::FormSelectPrev),
                                 KeyCode::Backspace => Some(Message::FormBackspace),
                                 KeyCode::Char('a')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>

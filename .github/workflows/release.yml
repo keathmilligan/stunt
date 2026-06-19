@@ -29,6 +29,10 @@ jobs:
     uses: keathmilligan/release-infra/.github/workflows/publish.yml@master
     with:
       tag: ${{ inputs.tag }}
+      # Build and publish from the exact commit the release job tagged, not the
+      # mutable tag ref. Prevents a re-release (which moves the tag) from causing
+      # stale bytes to be built/published (e.g. winget hash mismatches).
+      ref: ${{ needs.release.outputs.release_sha }}
       project-name: stunt
       binary-name: stunt
       project-type: rust

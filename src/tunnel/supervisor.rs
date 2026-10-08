@@ -15,15 +15,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use super::command::{command_display, spawn_detached_cmd};
 use super::output::LogStream;
-use super::pid::TunnelProcessType;
-use super::pid::is_live_tunnel;
+use super::pid::{TunnelProcessType, is_live_tunnel};
 use super::state::TunnelEvent;
+
+#[cfg(all(test, unix))]
+#[path = "supervisor_tests.rs"]
+mod tests;
 
 /// PID polling interval — how often we check if the tunnel process is alive
 /// (used only for adopted processes where we don't have a child handle).
@@ -58,13 +62,8 @@ const BASE_BACKOFF_SECS: u64 = 1;
 /// A factory function that builds a fresh `Command` for reconnection attempts.
 type CommandFactory = Box<dyn Fn() -> Command + Send + 'static>;
 
-/// A target for confirming that a tunnel is actually serving traffic.
-///
-/// For tunnels that bind a local listener (`ssh -L`/`-D`, `kubectl
-/// port-forward`), the listener only starts accepting connections once the
-/// underlying session is authenticated and the forward is established. A
-/// successful TCP connect to this address is therefore strong evidence that
-/// the tunnel is ready — much stronger than the process merely being alive.
+/// A local listener used to check tunnel readiness.
+/// A TCP connection to a proxy alone does not verify its remote destination.
 #[derive(Debug, Clone)]
 pub struct ReadinessProbe {
     /// Local address the tunnel listens on (e.g. "127.0.0.1").
@@ -83,10 +82,12 @@ impl ReadinessProbe {
     }
 }
 
-/// Manages the lifecycle of a tunnel connection (SSH, kubectl, or sshuttle).
+/// Manages the lifecycle of an SSH, Kubernetes, sshuttle, or SSM tunnel.
 pub struct Supervisor {
     /// Cancellation token to signal the supervision task to stop.
     cancel: CancellationToken,
+    /// Provider used to terminate helper processes along with the parent.
+    process_type: TunnelProcessType,
     /// Handle to the spawned tokio task.
     _handle: tokio::task::JoinHandle<()>,
     /// The current PID being monitored (0 if not yet spawned).
@@ -110,7 +111,7 @@ impl Supervisor {
     pub fn spawn(
         entry_id: uuid::Uuid,
         auto_restart: bool,
-        _process_type: TunnelProcessType,
+        process_type: TunnelProcessType,
         command_factory: CommandFactory,
         probe: Option<ReadinessProbe>,
         tx: mpsc::UnboundedSender<TunnelEvent>,
@@ -122,11 +123,11 @@ impl Supervisor {
         let suspended = Arc::new(AtomicBool::new(false));
         let suspended_clone = suspended.clone();
 
-        let _ = _process_type;
         let handle = tokio::spawn(async move {
             Self::run_spawn(
                 entry_id,
                 auto_restart,
+                process_type,
                 command_factory,
                 probe,
                 tx,
@@ -139,6 +140,7 @@ impl Supervisor {
 
         Supervisor {
             cancel,
+            process_type,
             _handle: handle,
             current_pid,
             suspended,
@@ -185,6 +187,7 @@ impl Supervisor {
 
         Supervisor {
             cancel,
+            process_type,
             _handle: handle,
             current_pid,
             suspended,
@@ -202,30 +205,9 @@ impl Supervisor {
     ///
     /// Used when the user explicitly disconnects a tunnel.
     pub fn cancel_and_kill(&self) {
+        self.suspended.store(true, Ordering::Relaxed);
         self.cancel.cancel();
-        let pid = self.current_pid.load(Ordering::Relaxed);
-        if pid == 0 {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            // Safety: SIGTERM is a standard signal. We only send it to a PID we spawned.
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
-        }
-        #[cfg(windows)]
-        {
-            // There is no signal mechanism on Windows; terminate the process
-            // tree with taskkill. `/T` includes child processes (e.g. ssh's
-            // helper processes), `/F` forces termination. We only target a PID
-            // we spawned ourselves. Detached so it cannot block the UI thread.
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
+        terminate_process(self.current_pid.load(Ordering::Relaxed), self.process_type);
     }
 
     /// Get the PID currently being monitored, or 0 if none.
@@ -251,9 +233,8 @@ impl Supervisor {
         tx: &mpsc::UnboundedSender<TunnelEvent>,
         current_pid: &Arc<AtomicU32>,
         cancel: &CancellationToken,
+        ssm_failure: Option<watch::Sender<Option<String>>>,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Option<i32>>), String> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
         let command = command_factory();
 
         // Emit the command being executed to the process output area.
@@ -263,10 +244,8 @@ impl Supervisor {
             text: format!("$ {}", command_display(&command)),
         });
 
-        let mut child = match spawn_detached_cmd(command) {
-            Ok(child) => child,
-            Err(e) => return Err(format!("failed to spawn process: {e}")),
-        };
+        let mut child =
+            spawn_detached_cmd(command).map_err(|e| format!("failed to spawn process: {e}"))?;
 
         let pid = child
             .id()
@@ -274,73 +253,25 @@ impl Supervisor {
         current_pid.store(pid, Ordering::Relaxed);
         let _ = tx.send(TunnelEvent::PidUpdate { entry_id, pid });
 
-        // Take stdout and stderr handles for async reading
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        // Spawn stdout reader. The reader is parked on a pipe that only closes
-        // when the process exits; since the process is intentionally left
-        // running on TUI quit, we also race the cancellation token so the task
-        // unwinds promptly on shutdown instead of blocking runtime teardown.
-        if let Some(stdout) = stdout {
-            let tx = tx.clone();
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        next = lines.next_line() => match next {
-                            Ok(Some(line)) => {
-                                if tx
-                                    .send(TunnelEvent::Output {
-                                        entry_id,
-                                        stream: LogStream::Stdout,
-                                        text: line,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        },
-                    }
-                }
-            });
+        if let Some(stdout) = child.stdout.take() {
+            spawn_output_reader(
+                stdout,
+                LogStream::Stdout,
+                entry_id,
+                tx.clone(),
+                cancel.clone(),
+                ssm_failure.clone(),
+            );
         }
-
-        // Spawn stderr reader (same cancellation handling as stdout).
-        if let Some(stderr) = stderr {
-            let tx = tx.clone();
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        next = lines.next_line() => match next {
-                            Ok(Some(line)) => {
-                                if tx
-                                    .send(TunnelEvent::Output {
-                                        entry_id,
-                                        stream: LogStream::Stderr,
-                                        text: line,
-                                    })
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            _ => break,
-                        },
-                    }
-                }
-            });
+        if let Some(stderr) = child.stderr.take() {
+            spawn_output_reader(
+                stderr,
+                LogStream::Stderr,
+                entry_id,
+                tx.clone(),
+                cancel.clone(),
+                ssm_failure,
+            );
         }
 
         // Spawn a task that waits for the child to exit and sends the result.
@@ -369,11 +300,10 @@ impl Supervisor {
 
     /// Wait until the tunnel is confirmed ready, or fails.
     ///
-    /// When a `probe` is available, readiness is confirmed by establishing a
-    /// TCP connection to the tunnel's local listener — this only succeeds once
-    /// the underlying session is authenticated and the forward is actually
-    /// serving traffic. This avoids the false-positive where a process is alive
-    /// but the tunnel is still negotiating or on its way to timing out.
+    /// With a local listener, check that the forwarding process accepts TCP.
+    /// SSM keeps the probe open briefly to trigger a destination connection and
+    /// allow the plugin's failure message to arrive before reporting Connected.
+    /// This does not verify application health or guarantee remote reachability.
     ///
     /// When no probe is available (e.g. remote-only `-R` forwards, which expose
     /// no local listener), it falls back to the stability-threshold heuristic:
@@ -382,6 +312,7 @@ impl Supervisor {
     /// Returns `true` once the tunnel is ready, `false` if the process exited,
     /// the probe timed out, or the channel closed.
     async fn wait_until_ready(
+        process_type: TunnelProcessType,
         probe: Option<&ReadinessProbe>,
         exit_rx: &mut mpsc::UnboundedReceiver<Option<i32>>,
         tx: &mpsc::UnboundedSender<TunnelEvent>,
@@ -424,8 +355,13 @@ impl Supervisor {
                 Err(mpsc::error::TryRecvError::Empty) => {}
             }
 
-            if Self::probe_once(probe).await {
-                return true;
+            let ready = if process_type == TunnelProcessType::Ssm {
+                Self::probe_ssm_once(probe).await
+            } else {
+                Self::probe_once(probe).await
+            };
+            if ready {
+                return matches!(exit_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
             }
 
             if tokio::time::Instant::now() >= deadline {
@@ -462,6 +398,22 @@ impl Supervisor {
         )
     }
 
+    /// Trigger a destination connection and allow time for SSM error output.
+    /// No application data is sent and no protocol response is required.
+    async fn probe_ssm_once(probe: &ReadinessProbe) -> bool {
+        let Ok(Ok(stream)) = tokio::time::timeout(
+            PROBE_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect((probe.address.as_str(), probe.port)),
+        )
+        .await
+        else {
+            return false;
+        };
+        tokio::time::sleep(STABILITY_THRESHOLD).await;
+        drop(stream);
+        true
+    }
+
     /// Main supervision loop for spawn mode.
     ///
     /// Uses child.wait() for process monitoring and captures stdout/stderr.
@@ -469,6 +421,7 @@ impl Supervisor {
     async fn run_spawn(
         entry_id: uuid::Uuid,
         auto_restart: bool,
+        process_type: TunnelProcessType,
         command_factory: CommandFactory,
         probe: Option<ReadinessProbe>,
         tx: mpsc::UnboundedSender<TunnelEvent>,
@@ -479,13 +432,34 @@ impl Supervisor {
         let mut attempt: u32 = 0;
 
         loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            // An unrelated listener must not make a new SSM session look ready.
+            if process_type == TunnelProcessType::Ssm
+                && let Some(probe) = &probe
+                && std::net::TcpListener::bind((probe.address.as_str(), probe.port)).is_err()
+            {
+                let _ = tx.send(TunnelEvent::Failed {
+                    entry_id,
+                    reason: format!(
+                        "Local port {} is unavailable; choose another port",
+                        probe.port
+                    ),
+                });
+                return;
+            }
+            // Failure messages can arrive after the local listener opens and
+            // do not cause the Session Manager plugin to exit.
+            let (failure_tx, mut failure_rx) = watch::channel(None);
             // Spawn the process and start capturing output
-            let (_pid, mut exit_rx) = match Self::spawn_and_capture(
+            let (pid, mut exit_rx) = match Self::spawn_and_capture(
                 entry_id,
                 &command_factory,
                 &tx,
                 &current_pid,
                 &cancel,
+                (process_type == TunnelProcessType::Ssm).then_some(failure_tx),
             ) {
                 Ok(result) => result,
                 Err(reason) => {
@@ -495,14 +469,22 @@ impl Supervisor {
             };
 
             // Phase 1: Wait until the tunnel is confirmed ready.
-            let stable =
-                Self::wait_until_ready(probe.as_ref(), &mut exit_rx, &tx, entry_id, &cancel).await;
+            let stable = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => false,
+                _ = wait_for_ssm_failure(&mut failure_rx), if process_type == TunnelProcessType::Ssm => false,
+                ready = Self::wait_until_ready(process_type, probe.as_ref(), &mut exit_rx, &tx, entry_id, &cancel) => ready,
+            };
 
             if cancel.is_cancelled() {
+                // Disconnect may race spawning, before current_pid was published.
+                if suspended.load(Ordering::Relaxed) {
+                    terminate_process(pid, process_type);
+                }
                 return;
             }
 
-            if stable {
+            if stable && failure_rx.borrow().is_none() {
                 // Reset backoff on successful connection
                 attempt = 0;
                 let _ = tx.send(TunnelEvent::Connected { entry_id });
@@ -510,6 +492,7 @@ impl Supervisor {
                 // Phase 2: Wait for process exit or cancellation
                 tokio::select! {
                     _ = cancel.cancelled() => return,
+                    _ = wait_for_ssm_failure(&mut failure_rx), if process_type == TunnelProcessType::Ssm => {},
                     _exit_code = exit_rx.recv() => {
                         // Process died — ExitStatus already sent by waiter task
                     }
@@ -518,13 +501,43 @@ impl Supervisor {
                 if cancel.is_cancelled() {
                     return;
                 }
-
-                // Process died
-                let _ = tx.send(TunnelEvent::Disconnected { entry_id });
-            } else {
-                // Process died before stability threshold
-                let _ = tx.send(TunnelEvent::Disconnected { entry_id });
             }
+
+            if process_type == TunnelProcessType::Ssm {
+                // The CLI may exit while its plugin still owns the listener.
+                // Also clean up a live CLI after a readiness timeout, before retrying.
+                terminate_process(pid, process_type);
+                if tokio::time::timeout(Duration::from_secs(2), exit_rx.recv())
+                    .await
+                    .is_err()
+                {
+                    #[cfg(unix)]
+                    // Safety: detached children lead their own process groups.
+                    unsafe {
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    }
+                }
+                current_pid
+                    .compare_exchange(pid, 0, Ordering::Relaxed, Ordering::Relaxed)
+                    .ok();
+            }
+
+            if cancel.is_cancelled() {
+                return;
+            }
+            let failure_reason = failure_rx.borrow().clone();
+            if let Some(reason) = &failure_reason {
+                let _ = tx.send(TunnelEvent::Output {
+                    entry_id,
+                    stream: LogStream::System,
+                    text: format!("SSM destination connection failed: {reason}"),
+                });
+            }
+            if !auto_restart && let Some(reason) = failure_reason {
+                let _ = tx.send(TunnelEvent::Failed { entry_id, reason });
+                return;
+            }
+            let _ = tx.send(TunnelEvent::Disconnected { entry_id });
 
             // Check if suspended — if so, stop reconnect loop
             if suspended.load(Ordering::Relaxed) {
@@ -593,6 +606,13 @@ impl Supervisor {
             stream: LogStream::System,
             text: format!("Adopted existing process (PID {pid}) — output capture unavailable"),
         });
+        if process_type == TunnelProcessType::Ssm {
+            let _ = tx.send(TunnelEvent::Output {
+                entry_id,
+                stream: LogStream::System,
+                text: "SSM destination errors cannot be monitored for an adopted process. Disconnect and reconnect to enable error monitoring.".to_string(),
+            });
+        }
 
         // Phase 1: Confirm readiness. Prefer a TCP probe of the local listener
         // (a live PID alone does not prove the tunnel is serving traffic); fall
@@ -617,11 +637,21 @@ impl Supervisor {
             if cancel.is_cancelled() {
                 return;
             }
-
-            let _ = tx.send(TunnelEvent::Disconnected { entry_id });
-        } else {
-            let _ = tx.send(TunnelEvent::Disconnected { entry_id });
         }
+
+        if process_type == TunnelProcessType::Ssm {
+            terminate_process(pid, process_type);
+            // Give the plugin time to release its listener before reconnecting.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while is_live_tunnel(pid, process_type) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            current_pid.store(0, Ordering::Relaxed);
+        }
+        if cancel.is_cancelled() {
+            return;
+        }
+        let _ = tx.send(TunnelEvent::Disconnected { entry_id });
 
         // Check if suspended
         if suspended.load(Ordering::Relaxed) {
@@ -637,6 +667,7 @@ impl Supervisor {
         Self::run_spawn(
             entry_id,
             auto_restart,
+            process_type,
             command_factory,
             probe,
             tx,
@@ -726,6 +757,88 @@ impl Supervisor {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Capture either output stream, preserving SSM failure detection and cancellation.
+/// Detached processes keep their pipes open on TUI quit, so cancellation must
+/// interrupt the read rather than waiting for EOF.
+fn spawn_output_reader(
+    reader: impl AsyncRead + Unpin + Send + 'static,
+    stream: LogStream,
+    entry_id: uuid::Uuid,
+    tx: mpsc::UnboundedSender<TunnelEvent>,
+    cancel: CancellationToken,
+    ssm_failure: Option<watch::Sender<Option<String>>>,
+) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            let line = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                next = lines.next_line() => match next {
+                    Ok(Some(line)) => line,
+                    _ => return,
+                },
+            };
+            if let Some(failure) = &ssm_failure
+                && line.contains("Connection to destination port failed")
+            {
+                failure.send_replace(Some(line.trim().to_string()));
+            }
+            if tx
+                .send(TunnelEvent::Output {
+                    entry_id,
+                    stream,
+                    text: line,
+                })
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+}
+
+/// Terminate a managed process, including the Session Manager plugin for SSM.
+fn terminate_process(pid: u32, process_type: TunnelProcessType) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // Safety: spawn_detached_cmd makes the child a session/process-group leader.
+        // Only SSM needs group termination to close its plugin's local listener.
+        let target = if process_type == TunnelProcessType::Ssm {
+            -(pid as libc::pid_t)
+        } else {
+            pid as libc::pid_t
+        };
+        unsafe {
+            libc::kill(target, libc::SIGTERM);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = process_type;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+/// Wait for a destination error without treating EOF as a failure signal.
+async fn wait_for_ssm_failure(rx: &mut watch::Receiver<Option<String>>) {
+    loop {
+        if rx.borrow().is_some() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }

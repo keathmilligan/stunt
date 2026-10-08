@@ -6,12 +6,12 @@ use uuid::Uuid;
 /// Top-level configuration containing all tunnel entries.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Config {
-    /// List of configured tunnel entries (SSH servers or Kubernetes workloads).
+    /// List of configured tunnel entries.
     #[serde(default)]
     pub entries: Vec<TunnelEntry>,
 }
 
-/// A tunnel entry — either an SSH server, a Kubernetes workload target, or an sshuttle VPN session.
+/// A tunnel entry for SSH, Kubernetes, sshuttle, or AWS SSM.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TunnelEntry {
@@ -21,6 +21,8 @@ pub enum TunnelEntry {
     K8s(K8sEntry),
     /// An sshuttle VPN-over-SSH session routing one or more subnets.
     Sshuttle(SshuttleEntry),
+    /// An AWS Systems Manager port-forwarding session.
+    Ssm(SsmEntry),
 }
 
 impl TunnelEntry {
@@ -30,6 +32,7 @@ impl TunnelEntry {
             TunnelEntry::Ssh(e) => e.id,
             TunnelEntry::K8s(e) => e.id,
             TunnelEntry::Sshuttle(e) => e.id,
+            TunnelEntry::Ssm(e) => e.id,
         }
     }
 
@@ -39,6 +42,7 @@ impl TunnelEntry {
             TunnelEntry::Ssh(e) => &e.name,
             TunnelEntry::K8s(e) => &e.name,
             TunnelEntry::Sshuttle(e) => &e.name,
+            TunnelEntry::Ssm(e) => &e.name,
         }
     }
 
@@ -48,8 +52,70 @@ impl TunnelEntry {
             TunnelEntry::Ssh(e) => e.auto_restart,
             TunnelEntry::K8s(e) => e.auto_restart,
             TunnelEntry::Sshuttle(e) => e.auto_restart,
+            TunnelEntry::Ssm(e) => e.auto_restart,
         }
     }
+}
+
+/// One AWS Session Manager port forward through a managed node.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SsmEntry {
+    /// Unique identifier for this entry.
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
+    /// Display name for the session.
+    pub name: String,
+    /// SSM managed-node ID (for example, an EC2 instance ID).
+    pub target: String,
+    /// Named AWS CLI profile; omitted to use the normal credential chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// AWS region; omitted to use the AWS CLI default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Host reachable from the managed node; omitted to forward to the node itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_host: Option<String>,
+    /// Loopback port opened by the Session Manager plugin.
+    pub local_port: u16,
+    /// Destination port on the managed node or remote host.
+    pub remote_port: u16,
+    /// Automatically restart the session while the TUI is running.
+    #[serde(default)]
+    pub auto_restart: bool,
+}
+
+impl SsmEntry {
+    /// Validate values from either a form or a hand-written configuration.
+    pub fn validate(&self) -> Result<(), SsmValidationError> {
+        if self.name.trim().is_empty() || self.target.trim().is_empty() {
+            return Err(SsmValidationError::MissingRequiredField);
+        }
+        if self.local_port == 0 || self.remote_port == 0 {
+            return Err(SsmValidationError::InvalidPort);
+        }
+        if [&self.profile, &self.region, &self.remote_host]
+            .iter()
+            .any(|value| value.as_ref().is_some_and(|s| s.trim().is_empty()))
+        {
+            return Err(SsmValidationError::EmptyOptionalField);
+        }
+        Ok(())
+    }
+}
+
+/// Invalid SSM session configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum SsmValidationError {
+    /// A required field is empty.
+    #[error("Name and Target are required")]
+    MissingRequiredField,
+    /// A forwarding port is zero.
+    #[error("Local Port and Remote Port must be between 1 and 65535")]
+    InvalidPort,
+    /// An optional value was provided but is blank.
+    #[error("Profile, Region and Remote Host must be omitted or non-empty")]
+    EmptyOptionalField,
 }
 
 /// An SSH server with connection details and tunnel forward definitions.
@@ -385,6 +451,45 @@ impl TunnelForward {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssm_defaults_and_mixed_config_round_trip() {
+        let config: Config = toml::from_str(
+            r#"
+            [[entries]]
+            type = "ssm"
+            name = "database"
+            target = "i-0123456789abcdef0"
+            local_port = 15432
+            remote_port = 5432
+            [[entries]]
+            type = "ssh"
+            name = "existing"
+            host = "bastion"
+        "#,
+        )
+        .unwrap();
+        let TunnelEntry::Ssm(entry) = &config.entries[0] else {
+            panic!("expected SSM")
+        };
+        assert!(entry.profile.is_none());
+        assert!(entry.region.is_none());
+        assert!(entry.remote_host.is_none());
+        assert!(!entry.auto_restart);
+        assert!(entry.validate().is_ok());
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(config, toml::from_str(&serialized).unwrap());
+
+        let mut entry = entry.clone();
+        entry.local_port = 0;
+        assert!(entry.validate().is_err());
+        entry.local_port = 15432;
+        entry.target.clear();
+        assert!(entry.validate().is_err());
+        entry.target = "i-example".into();
+        entry.remote_host = Some("  ".into());
+        assert!(entry.validate().is_err());
+    }
 
     // ── Existing SSH tests ───────────────────────────────────────────────
 

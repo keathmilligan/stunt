@@ -16,6 +16,8 @@ pub enum TunnelProcessType {
     Kubectl,
     /// An sshuttle VPN-over-SSH process (`sshuttle` binary).
     Sshuttle,
+    /// An AWS CLI Session Manager process (`aws` binary).
+    Ssm,
 }
 
 /// Check whether a process with the given PID is alive.
@@ -49,6 +51,7 @@ fn name_matches(name: &str, process_type: TunnelProcessType) -> bool {
         TunnelProcessType::Ssh => stem == "ssh" || stem.starts_with("ssh"),
         TunnelProcessType::Kubectl => stem == "kubectl" || stem.starts_with("kubectl"),
         TunnelProcessType::Sshuttle => stem == "sshuttle" || stem.starts_with("sshuttle"),
+        TunnelProcessType::Ssm => stem == "aws",
     }
 }
 
@@ -300,6 +303,10 @@ mod name_match_tests {
 
     #[test]
     fn test_name_matches_with_and_without_exe_suffix() {
+        assert!(name_matches("aws", TunnelProcessType::Ssm));
+        assert!(name_matches("aws.exe", TunnelProcessType::Ssm));
+        assert!(!name_matches("aws-vault", TunnelProcessType::Ssm));
+        assert!(!name_matches("python3", TunnelProcessType::Ssm));
         assert!(name_matches("ssh", TunnelProcessType::Ssh));
         assert!(name_matches("ssh.exe", TunnelProcessType::Ssh));
         assert!(name_matches("kubectl.exe", TunnelProcessType::Kubectl));

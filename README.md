@@ -7,7 +7,7 @@
   Stupid Tunnel Tricks
 ```
 
-**S**tupid **Tun**nel **T**ricks — a terminal user interface for defining, configuring, and managing SSH tunnel connections, Kubernetes port-forwards, and sshuttle VPN sessions.
+**S**tupid **Tun**nel **T**ricks — a terminal user interface for defining, configuring, and managing SSH tunnels, Kubernetes port-forwards, sshuttle VPN sessions, and AWS SSM port-forwards.
 
 ---
 
@@ -28,11 +28,12 @@ https://github.com/user-attachments/assets/4a80c80a-18e5-4c47-aaa1-9d4930e2eb6f
 
 ## Features
 
-`stunt` allows you to define tunnels with SSH, Kubernetes and `sshuttle` that persist when you close the app. While it is running, `stunt` monitors and maintains active tunnel connections.
+`stunt` allows you to define tunnels with SSH, Kubernetes, `sshuttle`, and AWS SSM that persist when you close the app. While it is running, `stunt` monitors and maintains active tunnel connections.
 
 - SSH local/remote
 - Kubernetes port-forwarding
 - sshuttle
+- AWS Systems Manager Session Manager port-forwarding (managed node or remote host)
 
 ## Installation
 
@@ -212,6 +213,67 @@ user = "alice"                    # optional
 identity_file = "~/.ssh/id_ed25519"  # optional
 auto_restart = true               # optional, default false
 ```
+
+### AWS SSM Entry
+
+Press `n`, select **AWS SSM**, and fill in the target managed-node ID and ports.
+Each entry opens one Session Manager port forward. Create separate entries for
+additional ports. **Remote Host** is optional: leave it blank to connect to a
+port on the target node, or set it to a hostname reachable from that node (for
+example, an RDS endpoint).
+
+```toml
+[[entries]]
+type = "ssm"
+name = "prod-db"
+target = "i-0123456789abcdef0"
+profile = "prod"                  # optional; uses the AWS CLI credential chain
+region = "us-east-1"              # optional; uses the AWS CLI region default
+local_port = 15432
+remote_port = 5432
+remote_host = "db.internal"       # optional; omit to forward to the node itself
+auto_restart = true               # optional, default false
+```
+
+Ports must be between 1 and 65535. The Session Manager plugin binds locally to
+loopback; connect your client to `localhost:15432` in this example. Profile and
+region can come from your AWS configuration or environment. STunT does not store
+AWS credentials or perform interactive sign-in; authenticate in your shell first
+(for example, `aws sso login --profile prod` for an SSO profile).
+
+Install **AWS CLI v2** and the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+on your PATH. The target must be an online SSM managed node, and your AWS identity
+must have permission to start sessions using the corresponding forwarding document.
+Managed-node forwarding requires SSM Agent 2.3.672.0 or later; remote-host forwarding
+requires 3.1.1374.0 or later, plus connectivity and DNS resolution from the managed
+node to the remote host. See [AWS port-forwarding prerequisites and examples](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-sessions-start.html).
+
+STunT invokes `aws ssm start-session` with `AWS-StartPortForwardingSession` or
+`AWS-StartPortForwardingSessionToRemoteHost`, captures its output, and checks the
+local listener before showing **connected**. It holds the initial probe open for
+three seconds to allow the plugin to report destination errors, then continues
+watching stdout and stderr. `Connection to destination port failed` fails the
+tunnel even if the plugin stays running; auto-restart retries with backoff when
+enabled. This detects reported failures, not application health. A port already
+in use is rejected.
+Use `Enter` to disconnect; this also terminates the plugin process. Quitting
+STunT leaves active tunnels running, and reopening it adopts saved sessions.
+Auto-restart runs only while STunT is open. As with other providers, logs from an
+adopted process are unavailable until the next reconnect, so destination-error
+monitoring also requires disconnecting and reconnecting an adopted SSM tunnel.
+
+## Architecture
+
+- `config/`: tagged TOML entry models and configuration/session persistence.
+- `app.rs`: application state, form validation, and event-driven state transitions.
+- `ui/`: read-only rendering of entries, forms, status, and process logs.
+- `tunnel/command.rs`: provider-specific command construction using argument arrays.
+- `tunnel/supervisor.rs`: shared detached-process lifecycle, readiness, logs,
+  reconnect backoff, and adoption of saved processes.
+- `event/` and `main.rs`: terminal/tunnel event delivery and the application loop.
+
+SSM uses the same supervisor and event flow as the other providers. The AWS CLI
+handles authentication and launches the Session Manager plugin for the data channel.
 
 ## License
 

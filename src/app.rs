@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::{
-    self, Config, K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry,
+    self, Config, K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry, SsmEntry,
     TunnelEntry, TunnelForward,
 };
 use crate::config::{SessionRecord, SessionState, load_sessions, save_sessions};
@@ -17,6 +17,7 @@ use crate::tunnel::is_live_tunnel;
 use crate::tunnel::{
     ConnectionState, LogStream, ProcessLog, ReadinessProbe, Supervisor, TunnelEvent,
     TunnelProcessType, build_kubectl_command, build_ssh_command, build_sshuttle_command,
+    build_ssm_command,
 };
 
 /// How long transient status messages are shown (in seconds).
@@ -27,7 +28,7 @@ const STATUS_MSG_DURATION_SECS: u64 = 3;
 pub enum AppMode {
     /// Normal list view.
     Normal,
-    /// Choosing the entry type for a new entry (SSH or K8s).
+    /// Choosing the provider for a new tunnel entry.
     TypeSelect(EntryTypeSelection),
     /// Editing or creating an entry.
     Form(FormState),
@@ -36,7 +37,7 @@ pub enum AppMode {
 /// State for the entry-type selection step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryTypeSelection {
-    /// 0 = SSH, 1 = K8s
+    /// 0 = SSH, 1 = K8s, 2 = sshuttle, 3 = SSM
     pub selected: usize,
 }
 
@@ -63,6 +64,8 @@ pub enum FormEntryType {
     K8s,
     /// sshuttle VPN-over-SSH entry.
     Sshuttle,
+    /// AWS SSM port-forwarding session.
+    Ssm,
 }
 
 /// State for the entry form (new or edit).
@@ -189,6 +192,8 @@ pub struct App {
     pub kubectl_warning: Option<String>,
     /// Warning message to show when sshuttle is unavailable (persisted until dismissed).
     pub sshuttle_warning: Option<String>,
+    /// Warning when AWS CLI or the Session Manager plugin is unavailable.
+    pub ssm_warning: Option<String>,
     /// Whether the app is running in demo mode (read-only, simulated tunnels).
     pub demo_mode: bool,
     /// Receiver for demo UI events (dialog open/close driven by the tour task).
@@ -240,6 +245,7 @@ impl App {
             mode: AppMode::Normal,
             kubectl_warning: None,
             sshuttle_warning: None,
+            ssm_warning: None,
             demo_mode,
             demo_ui_rx,
             process_logs: HashMap::new(),
@@ -301,6 +307,7 @@ impl App {
     /// found (which should not happen with the standard fixture set).
     pub fn demo_select_tunnel_type(&mut self, entry_type: FormEntryType) {
         let form = match &entry_type {
+            FormEntryType::Ssm => Self::new_ssm_form(),
             FormEntryType::Ssh => {
                 // Find first SSH fixture and pre-populate from it.
                 if let Some(TunnelEntry::Ssh(e)) = self
@@ -356,6 +363,7 @@ impl App {
                 TunnelEntry::Ssh(e) => Self::ssh_entry_to_form(e),
                 TunnelEntry::K8s(e) => Self::k8s_entry_to_form(e),
                 TunnelEntry::Sshuttle(e) => Self::sshuttle_entry_to_form(e),
+                TunnelEntry::Ssm(e) => Self::ssm_entry_to_form(e),
             };
             self.mode = AppMode::Form(form);
         }
@@ -462,6 +470,9 @@ impl App {
                         TunnelEntry::K8s(e) => {
                             self.mode = AppMode::Form(Self::k8s_entry_to_form(e));
                         }
+                        TunnelEntry::Ssm(e) => {
+                            self.mode = AppMode::Form(Self::ssm_entry_to_form(e));
+                        }
                         TunnelEntry::Sshuttle(e) => {
                             self.mode = AppMode::Form(Self::sshuttle_entry_to_form(e));
                         }
@@ -547,7 +558,7 @@ impl App {
                 }
             }
             Message::NavigateDown | Message::FormNextField => {
-                if sel.selected < 2 {
+                if sel.selected < 3 {
                     sel.selected += 1;
                 }
             }
@@ -557,7 +568,7 @@ impl App {
                     AppMode::TypeSelect(s) => s,
                     _ => return,
                 };
-                s.selected = (s.selected + 1) % 3;
+                s.selected = (s.selected + 1) % 4;
             }
             Message::FormSubmit => {
                 let entry_type_idx = match &self.mode {
@@ -568,7 +579,8 @@ impl App {
                 match entry_type_idx {
                     0 => self.mode = AppMode::Form(Self::new_ssh_form()),
                     1 => self.mode = AppMode::Form(Self::new_k8s_form()),
-                    _ => self.mode = AppMode::Form(Self::new_sshuttle_form()),
+                    2 => self.mode = AppMode::Form(Self::new_sshuttle_form()),
+                    _ => self.mode = AppMode::Form(Self::new_ssm_form()),
                 }
             }
             Message::FormCancel | Message::Quit => {
@@ -591,8 +603,8 @@ impl App {
         match msg {
             Message::FormNextField => {
                 match form.entry_type {
-                    FormEntryType::Sshuttle => {
-                        // Sshuttle form: only server fields, no forwards sub-form
+                    FormEntryType::Sshuttle | FormEntryType::Ssm => {
+                        // These providers keep all settings in the main form.
                         if form.focused_field < form.fields.len() - 1 {
                             form.focused_field += 1;
                         }
@@ -645,7 +657,7 @@ impl App {
                 }
             }
             Message::FormPrevField => match form.entry_type {
-                FormEntryType::Sshuttle => {
+                FormEntryType::Sshuttle | FormEntryType::Ssm => {
                     if form.focused_field > 0 {
                         form.focused_field -= 1;
                     }
@@ -758,7 +770,7 @@ impl App {
                 }
             },
             Message::FormAddForward => match form.entry_type {
-                FormEntryType::Sshuttle => { /* sshuttle has no forwards */ }
+                FormEntryType::Sshuttle | FormEntryType::Ssm => { /* no forward sub-form */ }
                 FormEntryType::Ssh => match form.focus {
                     FormFocus::ForwardEdit { .. } => {
                         if let Some(fwd) = self.build_ssh_forward_from_form() {
@@ -810,7 +822,7 @@ impl App {
             },
             Message::FormDeleteForward => match form.focus {
                 FormFocus::ForwardEdit { .. } => match form.entry_type {
-                    FormEntryType::Sshuttle => { /* no forwards */ }
+                    FormEntryType::Sshuttle | FormEntryType::Ssm => { /* no forwards */ }
                     FormEntryType::Ssh => {
                         if form.forwards.is_empty() {
                             form.focus = FormFocus::ServerFields;
@@ -833,7 +845,7 @@ impl App {
                     }
                 },
                 FormFocus::ForwardList => match form.entry_type {
-                    FormEntryType::Sshuttle => { /* no forwards */ }
+                    FormEntryType::Sshuttle | FormEntryType::Ssm => { /* no forwards */ }
                     FormEntryType::Ssh => {
                         if !form.forwards.is_empty() {
                             form.forwards.remove(form.selected_forward);
@@ -866,7 +878,7 @@ impl App {
             Message::FormCycleForwardType => {
                 if matches!(form.focus, FormFocus::ForwardEdit { .. }) {
                     match form.entry_type {
-                        FormEntryType::Sshuttle => { /* no forward types */ }
+                        FormEntryType::Sshuttle | FormEntryType::Ssm => { /* no forward types */ }
                         FormEntryType::Ssh => {
                             form.forward_type = (form.forward_type + 1) % 3;
                             form.forward_fields = Self::default_ssh_forward_fields();
@@ -895,7 +907,7 @@ impl App {
                         if matches!(form.focus, FormFocus::ForwardEdit { .. }) =>
                     {
                         match form.entry_type {
-                            FormEntryType::Sshuttle => { /* no forwards */ }
+                            FormEntryType::Sshuttle | FormEntryType::Ssm => { /* no forwards */ }
                             FormEntryType::Ssh => {
                                 if let Some(fwd) = self.build_ssh_forward_from_form() {
                                     self.commit_ssh_forward(fwd);
@@ -927,7 +939,7 @@ impl App {
                     }
                     AppMode::Form(ref form) if matches!(form.focus, FormFocus::ForwardList) => {
                         match form.entry_type {
-                            FormEntryType::Sshuttle => { /* no forwards */ }
+                            FormEntryType::Sshuttle | FormEntryType::Ssm => { /* no forwards */ }
                             FormEntryType::Ssh => {
                                 let idx = form.selected_forward;
                                 if let Some(fwd) = form.forwards.get(idx) {
@@ -974,7 +986,7 @@ impl App {
                 match form.focus {
                     FormFocus::ForwardEdit { .. } => {
                         let is_empty = match form.entry_type {
-                            FormEntryType::Sshuttle => true,
+                            FormEntryType::Sshuttle | FormEntryType::Ssm => true,
                             FormEntryType::Ssh => form.forwards.is_empty(),
                             FormEntryType::K8s => form.k8s_forwards.is_empty(),
                         };
@@ -982,7 +994,7 @@ impl App {
                             form.focus = FormFocus::ServerFields;
                         } else {
                             let len = match form.entry_type {
-                                FormEntryType::Sshuttle => 0,
+                                FormEntryType::Sshuttle | FormEntryType::Ssm => 0,
                                 FormEntryType::Ssh => form.forwards.len(),
                                 FormEntryType::K8s => form.k8s_forwards.len(),
                             };
@@ -1117,6 +1129,111 @@ impl App {
             forward_fields: Self::default_k8s_forward_fields(),
             k8s_forwards: vec![],
         }
+    }
+
+    /// Build a form for one Session Manager port mapping.
+    fn new_ssm_form() -> FormState {
+        FormState {
+            entry_type: FormEntryType::Ssm,
+            fields: [
+                ("Name", ""),
+                ("Target", ""),
+                ("Profile", ""),
+                ("Region", ""),
+                ("Remote Host", ""),
+                ("Local Port", ""),
+                ("Remote Port", ""),
+                ("Auto Restart", "no"),
+            ]
+            .into_iter()
+            .map(|(label, value)| FormField {
+                label: label.to_string(),
+                value: value.to_string(),
+            })
+            .collect(),
+            focused_field: 0,
+            editing_id: None,
+            forwards: vec![],
+            focus: FormFocus::ServerFields,
+            selected_forward: 0,
+            forward_field: 0,
+            forward_type: 0,
+            forward_fields: vec![],
+            k8s_forwards: vec![],
+        }
+    }
+
+    /// Pre-populate the SSM editor, preserving the entry identity.
+    fn ssm_entry_to_form(entry: &SsmEntry) -> FormState {
+        let mut form = Self::new_ssm_form();
+        form.editing_id = Some(entry.id);
+        let values = [
+            entry.name.clone(),
+            entry.target.clone(),
+            entry.profile.clone().unwrap_or_default(),
+            entry.region.clone().unwrap_or_default(),
+            entry.remote_host.clone().unwrap_or_default(),
+            entry.local_port.to_string(),
+            entry.remote_port.to_string(),
+            if entry.auto_restart { "yes" } else { "no" }.to_string(),
+        ];
+        for (field, value) in form.fields.iter_mut().zip(values) {
+            field.value = value;
+        }
+        form
+    }
+
+    /// Validate an SSM form without performing disk or process I/O.
+    fn ssm_entry_from_form(form: &FormState) -> Result<SsmEntry, String> {
+        let value = |index: usize| form.fields[index].value.trim().to_string();
+        let optional = |index| {
+            let value = value(index);
+            if value.is_empty() { None } else { Some(value) }
+        };
+        let port = |index| {
+            value(index)
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| "Local Port and Remote Port must be between 1 and 65535".to_string())
+        };
+        let entry = SsmEntry {
+            id: form.editing_id.unwrap_or_else(Uuid::new_v4),
+            name: value(0),
+            target: value(1),
+            profile: optional(2),
+            region: optional(3),
+            remote_host: optional(4),
+            local_port: port(5)?,
+            remote_port: port(6)?,
+            auto_restart: value(7).eq_ignore_ascii_case("yes"),
+        };
+        entry.validate().map_err(|e| e.to_string())?;
+        Ok(entry)
+    }
+
+    /// Save a validated SSM entry and return to the tunnel list.
+    fn submit_ssm_form(&mut self, form: FormState) {
+        let entry = match Self::ssm_entry_from_form(&form) {
+            Ok(entry) => entry,
+            Err(reason) => {
+                self.set_status(reason);
+                return;
+            }
+        };
+        let id = entry.id;
+        if let Some(existing) = self.entries.iter_mut().find(|e| e.id() == id) {
+            *existing = TunnelEntry::Ssm(entry);
+            self.set_status("Entry updated");
+        } else {
+            self.entries.push(TunnelEntry::Ssm(entry));
+            self.connection_states
+                .insert(id, ConnectionState::Disconnected);
+            self.selected = self.entries.len() - 1;
+            self.set_status("Entry created");
+        }
+        self.save_config();
+        self.mode = AppMode::Normal;
     }
 
     /// Build a new empty sshuttle entry form.
@@ -1542,6 +1659,7 @@ impl App {
             FormEntryType::Ssh => self.submit_ssh_form(form),
             FormEntryType::K8s => self.submit_k8s_form(form),
             FormEntryType::Sshuttle => self.submit_sshuttle_form(form),
+            FormEntryType::Ssm => self.submit_ssm_form(form),
         }
     }
 
@@ -1798,6 +1916,29 @@ impl App {
                     k8s_entry.auto_restart,
                     TunnelProcessType::Kubectl,
                     Box::new(move || build_kubectl_command(&k8s_entry, &k8s_entry.forwards)),
+                    probe,
+                    self.tunnel_tx.clone(),
+                )
+            }
+            TunnelEntry::Ssm(ssm) => {
+                if let Err(reason) = ssm
+                    .validate()
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| crate::tunnel::check_ssm_available())
+                {
+                    self.handle_tunnel_event(TunnelEvent::Failed {
+                        entry_id: id,
+                        reason,
+                    });
+                    return;
+                }
+                let probe = Some(ReadinessProbe::new("127.0.0.1", ssm.local_port));
+                let ssm = ssm.clone();
+                Supervisor::spawn(
+                    id,
+                    ssm.auto_restart,
+                    TunnelProcessType::Ssm,
+                    Box::new(move || build_ssm_command(&ssm)),
                     probe,
                     self.tunnel_tx.clone(),
                 )
@@ -2067,6 +2208,7 @@ impl App {
                     TunnelEntry::Ssh(_) => TunnelProcessType::Ssh,
                     TunnelEntry::K8s(_) => TunnelProcessType::Kubectl,
                     TunnelEntry::Sshuttle(_) => TunnelProcessType::Sshuttle,
+                    TunnelEntry::Ssm(_) => TunnelProcessType::Ssm,
                 })
                 .unwrap_or(TunnelProcessType::Ssh);
 
@@ -2113,6 +2255,19 @@ impl App {
                             auto_restart,
                             TunnelProcessType::Kubectl,
                             Box::new(move || build_kubectl_command(&k8s, &k8s.forwards)),
+                            probe,
+                            self.tunnel_tx.clone(),
+                        )
+                    }
+                    TunnelEntry::Ssm(ssm) => {
+                        let probe = Some(ReadinessProbe::new("127.0.0.1", ssm.local_port));
+                        let ssm = ssm.clone();
+                        Supervisor::adopt(
+                            id,
+                            pid,
+                            auto_restart,
+                            TunnelProcessType::Ssm,
+                            Box::new(move || build_ssm_command(&ssm)),
                             probe,
                             self.tunnel_tx.clone(),
                         )
@@ -2216,4 +2371,119 @@ fn ssh_readiness_probe(entry: &ServerEntry) -> Option<ReadinessProbe> {
         .iter()
         .find_map(|fwd| fwd.local_listen_target())
         .map(|(addr, port)| ReadinessProbe::new(addr, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let (tx, _) = mpsc::unbounded_channel();
+        App::new(Config::default(), tx, true, None)
+    }
+
+    fn valid_ssm_form() -> FormState {
+        let mut form = App::new_ssm_form();
+        for (field, value) in form.fields.iter_mut().zip([
+            "db",
+            "i-example",
+            "prod",
+            "eu-west-1",
+            "db.internal",
+            "15432",
+            "5432",
+            "yes",
+        ]) {
+            field.value = value.into();
+        }
+        form
+    }
+
+    #[test]
+    fn ssm_can_be_selected_created_edited_and_deleted() {
+        let mut app = test_app();
+        app.update(Message::NewEntry);
+        for _ in 0..3 {
+            app.update(Message::FormNextField);
+        }
+        app.update(Message::FormSubmit);
+        assert!(matches!(
+            app.mode,
+            AppMode::Form(FormState {
+                entry_type: FormEntryType::Ssm,
+                ..
+            })
+        ));
+        app.mode = AppMode::Form(valid_ssm_form());
+        app.update(Message::FormSubmit);
+        let original = app.entries[0].clone();
+        let id = original.id();
+        assert_eq!(app.state_of(&id), ConnectionState::Disconnected);
+        app.update(Message::EditEntry);
+        let AppMode::Form(form) = &mut app.mode else {
+            panic!("expected form")
+        };
+        assert_eq!(
+            TunnelEntry::Ssm(App::ssm_entry_from_form(form).unwrap()),
+            original
+        );
+        form.fields[0].value = "renamed".into();
+        form.fields[4].value.clear();
+        app.update(Message::FormSubmit);
+        assert_eq!(app.entries.len(), 1);
+        assert_eq!(app.entries[0].id(), id);
+        assert_eq!(app.entries[0].name(), "renamed");
+        let serialized = toml::to_string(&Config {
+            entries: app.entries.clone(),
+        })
+        .unwrap();
+        let parsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(parsed.entries, app.entries);
+        app.update(Message::DeleteEntry);
+        assert!(app.entries.is_empty());
+    }
+
+    #[test]
+    fn invalid_ssm_forms_stay_open_without_creating_entries() {
+        for (index, value) in [
+            (0, " "),
+            (1, ""),
+            (5, "0"),
+            (5, "65536"),
+            (6, "abc"),
+            (6, "-1"),
+        ] {
+            let mut app = test_app();
+            let mut form = valid_ssm_form();
+            form.fields[index].value = value.into();
+            app.mode = AppMode::Form(form);
+            app.update(Message::FormSubmit);
+            assert!(app.entries.is_empty());
+            assert!(matches!(app.mode, AppMode::Form(_)));
+            assert!(app.active_status_message().is_some());
+        }
+    }
+
+    #[test]
+    fn ssm_form_navigation_and_optional_defaults() {
+        let mut app = test_app();
+        app.mode = AppMode::Form(valid_ssm_form());
+        for _ in 0..10 {
+            app.update(Message::FormNextField);
+        }
+        app.update(Message::FormAddForward);
+        let AppMode::Form(form) = &mut app.mode else {
+            panic!("expected form")
+        };
+        assert_eq!(form.focused_field, 7);
+        assert!(matches!(form.focus, FormFocus::ServerFields));
+        for index in 2..=4 {
+            form.fields[index].value = "  ".into();
+        }
+        let entry = App::ssm_entry_from_form(form).unwrap();
+        assert!(entry.profile.is_none() && entry.region.is_none() && entry.remote_host.is_none());
+        app.update(Message::FormPrevField);
+        app.update(Message::FormCancel);
+        assert!(matches!(app.mode, AppMode::Normal));
+    }
 }

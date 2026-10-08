@@ -6,7 +6,10 @@ pub mod pid;
 mod state;
 mod supervisor;
 
-pub use command::{build_kubectl_command, build_ssh_command, build_sshuttle_command};
+pub use command::{
+    build_kubectl_command, build_ssh_command, build_sshuttle_command, build_ssm_command,
+};
+
 pub use output::{LogStream, ProcessLog};
 pub use pid::TunnelProcessType;
 #[cfg(any(unix, windows))]
@@ -57,4 +60,22 @@ pub fn check_sshuttle_available() -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
+}
+
+/// Check the local tools needed by AWS Session Manager without contacting AWS.
+pub fn check_ssm_available() -> Result<(), String> {
+    for program in ["aws", "session-manager-plugin"] {
+        if !std::process::Command::new(program)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Err(format!(
+                "{program} unavailable — install AWS CLI v2 and the Session Manager plugin for SSM tunnels"
+            ));
+        }
+    }
+    Ok(())
 }

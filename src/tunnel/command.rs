@@ -4,7 +4,39 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use crate::config::{K8sEntry, K8sPortForward, ServerEntry, SshuttleEntry};
+use crate::config::{K8sEntry, K8sPortForward, ServerEntry, SshuttleEntry, SsmEntry};
+
+/// Build an AWS CLI Session Manager port-forward command without a shell.
+/// Each session forwards one port; a remote host selects the remote-host document.
+pub fn build_ssm_command(entry: &SsmEntry) -> Command {
+    let mut cmd = Command::new("aws");
+    let mut parameters = serde_json::json!({
+        "portNumber": [entry.remote_port.to_string()],
+        "localPortNumber": [entry.local_port.to_string()],
+    });
+    let document = if let Some(host) = &entry.remote_host {
+        parameters["host"] = serde_json::json!([host]);
+        "AWS-StartPortForwardingSessionToRemoteHost"
+    } else {
+        "AWS-StartPortForwardingSession"
+    };
+    cmd.args(["ssm", "start-session", "--target"])
+        .arg(&entry.target)
+        .args(["--document-name", document, "--parameters"])
+        .arg(parameters.to_string());
+    if let Some(profile) = &entry.profile {
+        cmd.arg("--profile").arg(profile);
+    }
+    if let Some(region) = &entry.region {
+        cmd.arg("--region").arg(region);
+    }
+    cmd.env("AWS_PAGER", "")
+        .env("AWS_CLI_AUTO_PROMPT", "off")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
 
 /// Build a `tokio::process::Command` from a `ServerEntry`.
 ///
@@ -240,6 +272,69 @@ mod tests {
         K8sEntry, K8sPortForward, K8sResourceType, ServerEntry, SshuttleEntry, TunnelForward,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn ssm_commands_select_documents_and_encode_parameters() {
+        let mut entry = SsmEntry {
+            id: Uuid::new_v4(),
+            name: "db".into(),
+            target: "i-example".into(),
+            profile: None,
+            region: None,
+            remote_host: None,
+            local_port: 15432,
+            remote_port: 5432,
+            auto_restart: true,
+        };
+        for remote_host in [
+            None,
+            Some("db.internal"),
+            Some("quoted\"host;$(echo injected)"),
+        ] {
+            entry.remote_host = remote_host.map(str::to_string);
+            let cmd = build_ssm_command(&entry);
+            assert_eq!(cmd.as_std().get_program(), "aws");
+            let args: Vec<_> = cmd
+                .as_std()
+                .get_args()
+                .map(|s| s.to_str().unwrap())
+                .collect();
+            assert_eq!(
+                &args[..4],
+                &["ssm", "start-session", "--target", "i-example"]
+            );
+            assert_eq!(
+                args[5],
+                if remote_host.is_some() {
+                    "AWS-StartPortForwardingSessionToRemoteHost"
+                } else {
+                    "AWS-StartPortForwardingSession"
+                }
+            );
+            let params: serde_json::Value = serde_json::from_str(args[7]).unwrap();
+            assert_eq!(params["portNumber"], serde_json::json!(["5432"]));
+            assert_eq!(params["localPortNumber"], serde_json::json!(["15432"]));
+            if let Some(host) = remote_host {
+                assert_eq!(params["host"], serde_json::json!([host]));
+            } else {
+                assert!(params.get("host").is_none());
+            }
+            assert!(!args.contains(&"--profile"));
+            assert!(!args.contains(&"--region"));
+        }
+        entry.profile = Some("production account".into());
+        entry.region = Some("us-east-1".into());
+        let cmd = build_ssm_command(&entry);
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|s| s.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            &args[8..],
+            &["--profile", "production account", "--region", "us-east-1"]
+        );
+    }
 
     #[test]
     fn test_command_display_quotes_tokens_with_whitespace() {

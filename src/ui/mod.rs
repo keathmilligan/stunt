@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, AppMode, EntryTypeSelection, FormEntryType, FormFocus, FormState};
-use crate::config::{K8sEntry, ServerEntry, SshuttleEntry, TunnelEntry, TunnelForward};
+use crate::config::{K8sEntry, ServerEntry, SshuttleEntry, SsmEntry, TunnelEntry, TunnelForward};
 use crate::tunnel::{ConnectionState, LogStream};
 
 // ── Layout constants ────────────────────────────────────────────────────
@@ -144,7 +144,8 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
         .active_status_message()
         .map(|s| s.to_string())
         .or_else(|| app.kubectl_warning.as_ref().map(|w| format!("⚠ {w}")))
-        .or_else(|| app.sshuttle_warning.as_ref().map(|w| format!("⚠ {w}")));
+        .or_else(|| app.sshuttle_warning.as_ref().map(|w| format!("⚠ {w}")))
+        .or_else(|| app.ssm_warning.as_ref().map(|w| format!("⚠ {w}")));
 
     // Split into left (summary) and right (message). Both widgets carry the
     // background style so every cell in the bar is filled even when the text
@@ -287,6 +288,7 @@ fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         };
 
         match entry {
+            TunnelEntry::Ssm(ssm) => render_ssm_entry_row(frame, row_area, ssm, state, is_selected),
             TunnelEntry::Ssh(ssh) => render_ssh_entry_row(frame, row_area, ssh, state, is_selected),
             TunnelEntry::K8s(k8s) => render_k8s_entry_row(frame, row_area, k8s, state, is_selected),
             TunnelEntry::Sshuttle(s) => {
@@ -728,6 +730,61 @@ fn render_sshuttle_entry_row(
     let visible: Vec<Line> = lines.into_iter().take(area.height as usize).collect();
     let padded: Vec<Line> = visible.into_iter().map(|l| pad_line(l, w)).collect();
     frame.render_widget(Paragraph::new(padded), area);
+}
+
+/// Render an SSM session with the same six-line layout as other providers.
+fn render_ssm_entry_row(
+    frame: &mut Frame,
+    area: Rect,
+    entry: &SsmEntry,
+    state: ConnectionState,
+    is_selected: bool,
+) {
+    let bg = if is_selected {
+        COLOR_SELECTED_BG
+    } else {
+        Color::Reset
+    };
+    let color = state_to_color(state);
+    let mut title = vec![
+        Span::styled("[SSM] ", Style::default().fg(Color::Yellow).bg(bg)),
+        Span::styled(
+            format!("{} ", entry.name),
+            Style::default()
+                .fg(Color::White)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("[{}] ", state.label()),
+            Style::default().fg(color).bg(bg),
+        ),
+    ];
+    title.extend(auto_restart_spans(entry.auto_restart, bg));
+    let mut lines = vec![entry_line(color, bg, title)];
+    for text in [
+        entry.target.clone(),
+        format!(
+            "profile:{}  region:{}",
+            entry.profile.as_deref().unwrap_or("default"),
+            entry.region.as_deref().unwrap_or("default")
+        ),
+        format!(
+            "{} -> {}:{}",
+            entry.local_port,
+            entry.remote_host.as_deref().unwrap_or("target"),
+            entry.remote_port
+        ),
+        String::new(),
+        String::new(),
+    ] {
+        lines.push(entry_line(
+            color,
+            bg,
+            vec![Span::styled(text, Style::default().fg(Color::White).bg(bg))],
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Return the line as-is — ratatui clips to the widget area automatically.
@@ -1199,7 +1256,12 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 /// Render the entry type selection content centered within the details panel.
 fn render_type_select_overlay(frame: &mut Frame, area: Rect, sel: &EntryTypeSelection) {
-    let options = ["SSH Server", "Kubernetes Workload", "sshuttle VPN"];
+    let options = [
+        "SSH Server",
+        "Kubernetes Workload",
+        "sshuttle VPN",
+        "AWS SSM",
+    ];
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -1249,6 +1311,8 @@ fn render_type_select_overlay(frame: &mut Frame, area: Rect, sel: &EntryTypeSele
 fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
     let is_edit = form.editing_id.is_some();
     let title = match (&form.entry_type, is_edit) {
+        (FormEntryType::Ssm, false) => "New SSM Entry",
+        (FormEntryType::Ssm, true) => "Edit SSM Entry",
         (FormEntryType::Ssh, false) => "New SSH Entry",
         (FormEntryType::Ssh, true) => "Edit SSH Entry",
         (FormEntryType::K8s, false) => "New K8s Entry",
@@ -1340,20 +1404,55 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
             }
             lines.push(Line::from(spans));
         } else {
+            let placeholder = if matches!(form.entry_type, FormEntryType::Ssm) {
+                match field.label.as_str() {
+                    "Profile" | "Region" => "Optional; use AWS default",
+                    "Remote Host" => "Optional; use target instance",
+                    _ => "",
+                }
+            } else {
+                ""
+            };
+            let show_placeholder = field.value.is_empty() && !placeholder.is_empty();
             let value_style = if is_focused {
                 Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 60))
             } else {
                 Style::default().fg(Color::White)
             };
             let cursor = if is_focused { "_" } else { "" };
+            let value = if show_placeholder {
+                Span::styled(
+                    format!("{cursor}{placeholder}"),
+                    value_style.fg(Color::DarkGray),
+                )
+            } else {
+                Span::styled(format!("{}{cursor}", field.value), value_style)
+            };
             lines.push(Line::from(vec![
                 Span::styled(format!("{:>14}: ", field.label), label_style),
-                Span::styled(format!("{}{}", field.value, cursor), value_style),
+                value,
             ]));
         }
     }
 
-    if !matches!(form.entry_type, FormEntryType::Sshuttle) {
+    if matches!(form.entry_type, FormEntryType::Ssm) {
+        lines.push(Line::from(""));
+        for hint in [
+            "  Remote Host: another host reached through",
+            "  the target instance (e.g. an RDS endpoint).",
+            "  Leave blank to use the instance itself.",
+        ] {
+            lines.push(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    if !matches!(
+        form.entry_type,
+        FormEntryType::Sshuttle | FormEntryType::Ssm
+    ) {
         lines.push(Line::from(""));
 
         let hints = match form.focus {
@@ -1364,7 +1463,7 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
         let fwd_section_label = match form.entry_type {
             FormEntryType::Ssh => "  Forwards ",
             FormEntryType::K8s => "  Port Bindings ",
-            FormEntryType::Sshuttle => unreachable!(),
+            FormEntryType::Sshuttle | FormEntryType::Ssm => unreachable!(),
         };
         lines.push(Line::from(vec![
             Span::styled(
@@ -1418,7 +1517,7 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                     )]));
                 }
             }
-            FormEntryType::Sshuttle => unreachable!(),
+            FormEntryType::Sshuttle | FormEntryType::Ssm => unreachable!(),
         }
     }
 
@@ -1441,7 +1540,9 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                 format!("{editing_label} — Type: {type_name}  (Ctrl+T to cycle)")
             }
             FormEntryType::K8s => format!("{editing_label} — kubectl port-forward"),
-            FormEntryType::Sshuttle => unreachable!("sshuttle has no forward sub-form"),
+            FormEntryType::Sshuttle | FormEntryType::Ssm => {
+                unreachable!("this provider has no forward sub-form")
+            }
         };
 
         lines.push(Line::from(vec![Span::styled(
@@ -1458,7 +1559,9 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, form: &FormState) {
                 }
             }
             FormEntryType::K8s => 2,
-            FormEntryType::Sshuttle => unreachable!("sshuttle has no forward sub-form"),
+            FormEntryType::Sshuttle | FormEntryType::Ssm => {
+                unreachable!("this provider has no forward sub-form")
+            }
         };
 
         for (fi, field) in form.forward_fields.iter().enumerate().take(num_fields) {
@@ -1552,6 +1655,58 @@ fn forward_styles(is_selected: bool) -> (Style, Style) {
 #[cfg(test)]
 mod tests {
     use super::wrap_text;
+
+    #[test]
+    fn ssm_menu_form_and_sidebar_render() {
+        use super::draw;
+        use crate::app::{App, Message};
+        use ratatui::{Terminal, backend::TestBackend};
+        let config: crate::config::Config = toml::from_str(
+            r#"
+            [[entries]]
+            type = "ssm"
+            name = "database"
+            target = "i-example"
+            local_port = 15432
+            remote_port = 5432
+        "#,
+        )
+        .unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(config, tx, true, None);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, app: &App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(render(&mut terminal, &app).contains("[SSM] database"));
+        app.update(Message::NewEntry);
+        assert!(render(&mut terminal, &app).contains("AWS SSM"));
+        for _ in 0..3 {
+            app.update(Message::FormNextField);
+        }
+        app.update(Message::FormSubmit);
+        let text = render(&mut terminal, &app);
+        for label in [
+            "New SSM Entry",
+            "Target",
+            "Profile",
+            "Region",
+            "Remote Host",
+            "Local Port",
+            "Remote Port",
+            "Auto Restart",
+        ] {
+            assert!(text.contains(label), "missing {label}");
+        }
+        assert!(!text.contains("Ctrl+A add"));
+    }
 
     fn longest(segments: &[String]) -> usize {
         segments

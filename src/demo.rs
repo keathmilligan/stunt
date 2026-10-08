@@ -488,6 +488,7 @@ pub fn start_demo_tour(
             TunnelEntry::Ssh(s) => s.id,
             TunnelEntry::K8s(k) => k.id,
             TunnelEntry::Sshuttle(s) => s.id,
+            TunnelEntry::Ssm(s) => s.id,
         })
         .take(3)
         .collect();
@@ -531,6 +532,7 @@ async fn run_demo_tour(
             FormEntryType::Ssh => ssh_id.is_some(),
             FormEntryType::K8s => k8s_id.is_some(),
             FormEntryType::Sshuttle => sshuttle_id.is_some(),
+            FormEntryType::Ssm => false,
         })
         .collect();
 

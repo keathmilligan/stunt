@@ -68,9 +68,16 @@ async fn run() -> anyhow::Result<()> {
             entries: demo::demo_entries(),
         }
     } else {
-        // Check that ssh is available on PATH (only in normal mode)
-        tunnel::check_ssh_available()?;
-        config::load()?
+        let config = config::load()?;
+        // SSM and Kubernetes entries do not need an SSH installation.
+        if config
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, TunnelEntry::Ssh(_) | TunnelEntry::Sshuttle(_)))
+        {
+            tunnel::check_ssh_available()?;
+        }
+        config
     };
 
     // Start the event loop (terminal + tunnel event channels)
@@ -99,6 +106,15 @@ async fn run() -> anyhow::Result<()> {
     };
 
     if !cli.demo {
+        if cfg
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, TunnelEntry::Ssm(_)))
+            && let Err(warning) = tunnel::check_ssm_available()
+        {
+            app.ssm_warning = Some(warning);
+        }
+
         // Warn if kubectl is unavailable and K8s entries are configured
         let has_k8s_entries = cfg.entries.iter().any(|e| matches!(e, TunnelEntry::K8s(_)));
         if has_k8s_entries && !tunnel::check_kubectl_available() {
